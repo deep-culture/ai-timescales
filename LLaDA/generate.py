@@ -39,16 +39,6 @@ def get_num_transfer_tokens(mask_index, steps):
 
     return num_transfer_tokens
 
-attn_store = {}
-@ torch.no_grad()
-def hook_fn(module, input, output):
-    # For LlamaAttention with output_attentions=True, output is (hidden, attn_weights, kv_cache)
-    # With eager attention, output[1] is the attention weight tensor
-    if isinstance(output, tuple) and len(output) > 1:
-        print(output[1])
-        attn_store['last'] = output[1] # (batch, n_heads, seq, seq)
-
-
 @ torch.no_grad()
 def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, block_length=128, temperature=0.,
              cfg_scale=0., remasking='low_confidence', mask_id=126336, logits_eos_inf=False, confidence_eos_eot_inf=False):
@@ -66,11 +56,14 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         logits_eos_inf: Whether to set the logits of EOS token to -inf. See Appendix B.4 of LLaDA for details
         confidence_eos_eot_inf: Whether to set the confidence of EOS and EoT token to -inf. See Appendix B.4 of LLaDA for details
     '''
+
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
 
     if attention_mask is not None:
-        attention_mask = torch.cat([attention_mask, torch.ones((prompt.shape[0], gen_length), dtype=attention_mask.dtype, device=model.device)], dim=-1)
+        attention_mask = torch.cat([attention_mask,
+                                    torch.ones((prompt.shape[0], gen_length), dtype=attention_mask.dtype,
+                                               device=model.device)], dim=-1)
 
     prompt_index = (x != mask_id)
 
@@ -80,8 +73,12 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
     assert steps % num_blocks == 0
     steps = steps // num_blocks
 
+    step_tokens = []  # token state AFTER each denoising step: list of (batch, seq_len)
+    step_attentions = []  # last-layer attn weights per step:       list of (batch, n_heads, seq, seq)
+
     for num_block in range(num_blocks):
-        block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
+        block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (
+                    num_block + 1) * block_length] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
         for i in range(steps):
             mask_index = (x == mask_id)
@@ -97,19 +94,21 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
             else:
                 logits = model(x, attention_mask=attention_mask).logits
 
+            # Collect attention weights via patch side-channel (set by patch_llada.py)
+            step_attentions.append(model.model.transformer.blocks[-1]._attn_weights.detach().cpu())
+
             if logits_eos_inf:
                 logits[:, :, 126081] = -torch.inf
 
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-            x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
-            
+            x0 = torch.argmax(logits_with_noise, dim=-1)  # b, l
+
             if confidence_eos_eot_inf:
                 logits_with_noise[:, :, 126081] = logits[:, :, 126348] = -torch.inf
 
             if remasking == 'low_confidence':
                 p = F.softmax(logits, dim=-1)
-                x0_p = torch.squeeze(
-                    torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
+                x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
             elif remasking == 'random':
                 x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
             else:
@@ -126,7 +125,10 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                 transfer_index[j, select_index] = True
             x[transfer_index] = x0[transfer_index]
 
-    return x
+            # Snapshot token state AFTER tokens are revealed this step
+            step_tokens.append(x.detach().cpu().clone())
+
+    return x, step_tokens, step_attentions
 
 
 def main():
@@ -166,16 +168,13 @@ def main():
     attention_mask = encoded_outputs['attention_mask'].to(device)
 
     # Find the last attention module
-    last_attn_module = model.model.layers[-1].self_attn
-    hook = last_attn_module.attention_scores_hook(hook_fn)
+
     out = generate(model, input_ids, attention_mask, steps=128, gen_length=128, block_length=32, temperature=0., cfg_scale=0., remasking='low_confidence')
     output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
-    hook.remove()
 
     for o in output:
         print(o)
         print('-' * 50)
-        print(attn_store)
 
 if __name__ == '__main__':
     main()
