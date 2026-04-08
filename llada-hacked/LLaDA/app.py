@@ -11,8 +11,12 @@ print(f"Using device: {device}")
 
 # Load model and tokenizer
 tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
-model = AutoModel.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, 
-                                  torch_dtype=torch.bfloat16).to(device)
+model = AutoModel.from_pretrained(
+    'GSAI-ML/LLaDA-8B-Instruct',
+    trust_remote_code=True,
+    torch_dtype=torch.bfloat16,
+    attn_implementation='eager'
+).to(device)
 
 # Constants
 MASK_TOKEN = "[MASK]"

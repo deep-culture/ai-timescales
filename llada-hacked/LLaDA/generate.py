@@ -39,6 +39,15 @@ def get_num_transfer_tokens(mask_index, steps):
 
     return num_transfer_tokens
 
+attn_store = {}
+@ torch.no_grad()
+def hook_fn(module, input, output):
+    # For LlamaAttention with output_attentions=True, output is (hidden, attn_weights, kv_cache)
+    # With eager attention, output[1] is the attention weight tensor
+    if isinstance(output, tuple) and len(output) > 1:
+        print(output[1])
+        attn_store['last'] = output[1] # (batch, n_heads, seq, seq)
+
 
 @ torch.no_grad()
 def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, block_length=128, temperature=0.,
@@ -123,7 +132,12 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
 def main():
     device = 'cuda'
 
-    model = AutoModel.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
+    model = AutoModel.from_pretrained(
+        'GSAI-ML/LLaDA-8B-Instruct',
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        attn_implementation='eager'
+    ).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
 
     # The LLaDA architecture theoretically supports both left-padding and right-padding. 
@@ -151,11 +165,17 @@ def main():
     input_ids = encoded_outputs['input_ids'].to(device)
     attention_mask = encoded_outputs['attention_mask'].to(device)
 
+    # Find the last attention module
+    last_attn_module = model.model.layers[-1].self_attn
+    hook = last_attn_module.attention_scores_hook(hook_fn)
     out = generate(model, input_ids, attention_mask, steps=128, gen_length=128, block_length=32, temperature=0., cfg_scale=0., remasking='low_confidence')
     output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
+    hook.remove()
+
     for o in output:
         print(o)
         print('-' * 50)
+        print(attn_store)
 
 if __name__ == '__main__':
     main()
