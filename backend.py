@@ -9,7 +9,17 @@ import json
 import threading
 
 from dotenv import load_dotenv
-load_dotenv()   # loads .env from the repo root before any os.environ reads
+from pathlib import Path
+import os
+
+_HERE = Path(__file__).parent.resolve()
+load_dotenv(_HERE / ".env")
+
+if not os.environ.get("HF_HOME"):
+    os.environ["HF_HOME"] = str(_HERE / "huggingface")
+
+print(f"[server] HF_HOME = {os.environ['HF_HOME']}", flush=True)
+
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 

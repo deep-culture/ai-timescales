@@ -4,10 +4,12 @@ AI-Timescales – dual-model comparison UI.
 Layout
   • Small "last message" bar at the top
   • LLaMA (AR) output  |  LLaDA (diffusion) output   — side by side
+  • "AUTOREGRESS" button  → runs only the LLaMA AR panel
+  • "DIFFUSE" button      → runs only the LLaDA diffusion panel
+  • Enter key             → runs both sequentially (LLaMA first, then LLaDA)
   • LLaMA vocalises each new token immediately as it is generated
   • LLaDA vocalises all tokens simultaneously per denoising step;
     MASK positions play a short white-noise burst
-  • LLaDA fires only after LLaMA has finished
 
 Start:
     uvicorn backend:app --port 8000 --workers 1
@@ -26,7 +28,7 @@ from typing import Callable, Coroutine, List
 
 import httpx
 import numpy as np
-from nicegui import ui, app, run
+from nicegui import ui, run
 
 BACKEND = "http://localhost:8000"
 
@@ -116,7 +118,6 @@ def _make_llada_audio(decoded_tokens: List[str], mask_positions: List[int]) -> l
     One WAV per token position:
       mask     → white noise  (instant, no TTS)
       revealed → _synth()     (cached after first call)
-    Generated sequentially; TTS lock serialises anyway.
     """
     mask_set = set(mask_positions)
     results: list[bytes] = []
@@ -179,10 +180,10 @@ async def _play_many(wavs: list[bytes]) -> None:
 # ── page ──────────────────────────────────────────────────────────────────
 @ui.page("/")
 async def index():
-    # Per-page state — no reliance on stale globals
+    # Per-page state – no stale globals
     state = {
         "busy":           False,
-        "online":         False,   # is backend currently reachable?
+        "online":         False,   # backend reachable?
         "llama_model":    None,    # populated by first successful _check_server
         "llada_model":    None,
         "llama_prev_ids": [],
@@ -235,17 +236,26 @@ async def index():
 
         ui.separator()
 
-        # ── input row ─────────────────────────────────────────────────────
+        # ── input + action buttons ────────────────────────────────────────
         with ui.row().classes("w-full items-center gap-2"):
             user_input = ui.input(placeholder="Type your message…").props(
                 "outlined dense"
             ).classes("flex-grow")
-            send_btn = ui.button("Send", icon="send")
-            send_btn.disable()   # disabled until first successful health check
+            # AR button – purple, matches LLaMA panel
+            ar_btn = ui.button("Autoregress", icon="fast_forward").props(
+                'color="purple"'
+            )
+            ar_btn.disable()
+            # Diffusion button – teal, matches LLaDA panel
+            diffuse_btn = ui.button("Diffuse", icon="blur_on").props(
+                'color="teal"'
+            )
+            diffuse_btn.disable()
+            # Stop / Clear toggle
             stop_btn = ui.button("Clear", icon="delete", color="negative")
 
-        # ── server status row (always visible below the input) ────────────
-        with ui.row().classes("w-full items-center gap-2"):
+        # ── server status row (always visible) ────────────────────────────
+        with ui.row().classes("w-full items-center gap-2 mt-1"):
             server_dot   = ui.html(
                 '<span style="color:#888;font-size:15px;line-height:1">●</span>'
             )
@@ -253,16 +263,36 @@ async def index():
                 "text-xs text-gray-400"
             )
 
-        # ── generation progress (separate line) ───────────────────────────
+        # ── generation progress ───────────────────────────────────────────
         gen_status = ui.label("").classes("text-xs text-gray-500")
 
-    # ── per-page server health check ──────────────────────────────────────
+    # ── server health + model discovery ───────────────────────────────────
+    def _update_buttons() -> None:
+        """Enable/disable action buttons to match current state."""
+        if state["busy"] or not state["online"]:
+            ar_btn.disable()
+            diffuse_btn.disable()
+        else:
+            if state["llama_model"]:
+                ar_btn.enable()
+            else:
+                ar_btn.disable()
+            if state["llada_model"]:
+                diffuse_btn.enable()
+            else:
+                diffuse_btn.disable()
+
+    def _mark_offline(reason: str) -> None:
+        state["online"] = False
+        server_dot.content = (
+            '<span style="color:#f87171;font-size:15px;line-height:1">●</span>'
+        )
+        server_label.text = f"Backend offline — {reason}"
+        ar_btn.disable()
+        diffuse_btn.disable()
+
     async def _check_server() -> None:
-        """
-        Poll GET /status.  Updates the indicator dot, server_label, model name
-        labels in the panels, and enables/disables send_btn.
-        Runs once on page load then every 5 s via ui.timer.
-        """
+        """Poll GET /status; update indicator + buttons. Runs on load + every 5 s."""
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
                 r = await client.get(f"{BACKEND}/status")
@@ -284,17 +314,15 @@ async def index():
             llama_name_label.text = state["llama_model"] or "No AR model loaded"
             llada_name_label.text = state["llada_model"] or "No diffusion model loaded"
 
-            # Status indicator
             server_dot.content = (
                 '<span style="color:#4ade80;font-size:15px;line-height:1">●</span>'
             )
-            if models:
-                server_label.text = f"Backend online — {', '.join(models)}"
-            else:
-                server_label.text = "Backend online — no models loaded yet"
-
-            if not state["busy"]:
-                send_btn.enable()
+            server_label.text = (
+                f"Backend online — {', '.join(models)}"
+                if models else
+                "Backend online — no models loaded yet"
+            )
+            _update_buttons()
 
         except httpx.ConnectError:
             _mark_offline("cannot connect to port 8000")
@@ -303,15 +331,6 @@ async def index():
         except Exception as exc:
             _mark_offline(f"{type(exc).__name__}: {str(exc)[:60]}")
 
-    def _mark_offline(reason: str) -> None:
-        state["online"] = False
-        server_dot.content = (
-            '<span style="color:#f87171;font-size:15px;line-height:1">●</span>'
-        )
-        server_label.text = f"Backend offline — {reason}"
-        send_btn.disable()
-
-    # Fire immediately on page load, then poll every 5 s
     await _check_server()
     ui.timer(5.0, _check_server)
 
@@ -324,7 +343,7 @@ async def index():
         """
         POST /generate and consume SSE events.
         Returns True on clean completion, False on cancel / error / unreachable.
-        Sets gen_status.text on any failure so callers don't have to.
+        Always sets gen_status.text on failure.
         """
         try:
             async with httpx.AsyncClient(
@@ -363,35 +382,52 @@ async def index():
             gen_status.text = f"⚠ {exc}"
         return False
 
-    # ── send handler ──────────────────────────────────────────────────────
-    async def on_send() -> None:
-        # Double-guard: busy flag and online check
+    # ── shared generation helpers ─────────────────────────────────────────
+    def _begin(msg: str) -> None:
+        """Shared setup: set busy, update buttons/stop, clear status."""
+        state["busy"] = True
+        _update_buttons()
+        stop_btn.text = "Stop"
+        stop_btn.props("icon=stop")
+        last_msg.text = msg
+        gen_status.text = ""
+
+    def _end(ok: bool) -> None:
+        """Shared teardown: clear busy flag, update status text + buttons."""
+        if ok:
+            gen_status.text = "✓ Done"
+        elif gen_status.text.startswith("⟳"):
+            # _stream returned False but spinner still showing → silent cancel
+            gen_status.text = "Stopped."
+        state["busy"] = False
+        _update_buttons()
+        stop_btn.text = "Clear"
+        stop_btn.props("icon=delete")
+
+    def _params() -> tuple[bool, int, int, int, float]:
+        return (
+            tts_toggle.value,
+            int(gen_length.value),
+            int(n_steps.value),
+            int(block_len.value),
+            float(temperature.value),
+        )
+
+    # ── AUTOREGRESS button ────────────────────────────────────────────────
+    async def on_autoregress() -> None:
         if state["busy"] or not state["online"]:
             return
         msg = user_input.value.strip()
         if not msg:
             return
-
-        state["busy"] = True
-        send_btn.disable()
-        stop_btn.text = "Stop"
-        stop_btn.props("icon=stop")
         user_input.value = ""
-        last_msg.text = msg
+
+        _begin(msg)
         llama_html.content = ""
-        llada_html.content = ""
-        gen_status.text = ""
-        do_tts = tts_toggle.value
+        do_tts, gl, st, bl, tmp = _params()
+        ok = True
 
-        gl  = int(gen_length.value)
-        st  = int(n_steps.value)
-        bl  = int(block_len.value)
-        tmp = float(temperature.value)
-
-        ok = True   # tracks whether all phases succeeded
-
-        # ── Phase 1: LLaMA — token by token ──────────────────────────────
-        if state["llama_model"] and ok:
+        if state["llama_model"]:
             gen_status.text = f"⟳ {state['llama_model']}…"
 
             async def llama_step(ev: StepEvent) -> None:
@@ -419,8 +455,23 @@ async def index():
                 on_done=llama_done,
             )
 
-        # ── Phase 2: LLaDA — fires ONLY after LLaMA succeeds ─────────────
-        if state["llada_model"] and ok:
+        _end(ok)
+
+    # ── DIFFUSE button ────────────────────────────────────────────────────
+    async def on_diffuse() -> None:
+        if state["busy"] or not state["online"]:
+            return
+        msg = user_input.value.strip()
+        if not msg:
+            return
+        user_input.value = ""
+
+        _begin(msg)
+        llada_html.content = ""
+        do_tts, gl, st, bl, tmp = _params()
+        ok = True
+
+        if state["llada_model"]:
             gen_status.text = f"⟳ {state['llada_model']}…"
 
             async def llada_step(ev: StepEvent) -> None:
@@ -452,32 +503,94 @@ async def index():
                 on_done=llada_done,
             )
 
-        # ── finalise ──────────────────────────────────────────────────────
-        if ok:
-            gen_status.text = "✓ Done"
-        elif gen_status.text.startswith("⟳"):
-            # _stream returned False but gen_status still shows the spinner
-            # (happens on silent cancellation) — make it explicit
-            gen_status.text = "Stopped."
+        _end(ok)
 
-        state["busy"] = False
-        # Only re-enable send if backend is still reachable
-        if state["online"]:
-            send_btn.enable()
-        stop_btn.text = "Clear"
-        stop_btn.props("icon=delete")
+    # ── Enter key → run both sequentially (LLaMA first, then LLaDA) ──────
+    async def on_both() -> None:
+        if state["busy"] or not state["online"]:
+            return
+        msg = user_input.value.strip()
+        if not msg:
+            return
+        user_input.value = ""
+
+        _begin(msg)
+        llama_html.content = ""
+        llada_html.content = ""
+        do_tts, gl, st, bl, tmp = _params()
+        ok = True
+
+        if state["llama_model"] and ok:
+            gen_status.text = f"⟳ {state['llama_model']}…"
+
+            async def both_llama_step(ev: StepEvent) -> None:
+                llama_html.content = _render_llama(ev)
+                llama_scroll.scroll_to(percent=1.0)
+                if do_tts and ev.newly_revealed:
+                    tok = ev.decoded_tokens[ev.newly_revealed[0]]
+                    if tok.strip():
+                        wav = await run.io_bound(_synth, tok)
+                        if wav:
+                            await _play_one(wav)
+
+            async def both_llama_done(data: dict) -> None:
+                state["llama_prev_ids"] = data.get("final_token_ids", [])
+
+            ok = await _stream(
+                payload={
+                    "model":          state["llama_model"],
+                    "messages":       [{"role": "user", "content": msg}],
+                    "prev_token_ids": state["llama_prev_ids"],
+                    "gen_length": gl, "steps": st,
+                    "block_length": bl, "temperature": tmp,
+                },
+                on_step=both_llama_step,
+                on_done=both_llama_done,
+            )
+
+        if state["llada_model"] and ok:
+            gen_status.text = f"⟳ {state['llada_model']}…"
+
+            async def both_llada_step(ev: StepEvent) -> None:
+                hdr = (
+                    f"<span style='color:#555;font-size:11px;font-family:monospace'>"
+                    f"step {ev.step_index + 1}</span><br>"
+                )
+                llada_html.content = hdr + _render_llada(ev)
+                llada_scroll.scroll_to(percent=1.0)
+                if do_tts:
+                    wavs = await run.io_bound(
+                        _make_llada_audio, ev.decoded_tokens, ev.mask_positions
+                    )
+                    if wavs:
+                        await _play_many(wavs)
+
+            async def both_llada_done(data: dict) -> None:
+                state["llada_prev_ids"] = data.get("final_token_ids", [])
+
+            ok = await _stream(
+                payload={
+                    "model":          state["llada_model"],
+                    "messages":       [{"role": "user", "content": msg}],
+                    "prev_token_ids": state["llada_prev_ids"],
+                    "gen_length": gl, "steps": st,
+                    "block_length": bl, "temperature": tmp,
+                },
+                on_step=both_llada_step,
+                on_done=both_llada_done,
+            )
+
+        _end(ok)
 
     # ── stop / clear ──────────────────────────────────────────────────────
     async def on_stop_or_clear() -> None:
         if state["busy"]:
-            # Signal backend to stop after the current step
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
                     await client.post(f"{BACKEND}/stop")
             except Exception:
                 pass
         else:
-            # Idle → clear both panels and conversation context
             llama_html.content = ""
             llada_html.content = ""
             last_msg.text = "—"
@@ -486,8 +599,9 @@ async def index():
             state["llada_prev_ids"] = []
 
     # ── bind events ───────────────────────────────────────────────────────
-    send_btn.on_click(on_send)
-    user_input.on("keydown.enter", on_send)
+    ar_btn.on_click(on_autoregress)
+    diffuse_btn.on_click(on_diffuse)
+    user_input.on("keydown.enter", on_both)
     stop_btn.on_click(on_stop_or_clear)
 
 
