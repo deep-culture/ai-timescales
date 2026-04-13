@@ -1,6 +1,7 @@
 """LLaDA diffusion-language-model generator."""
 from __future__ import annotations
 
+from collections import Counter
 from typing import Iterator, List
 
 import numpy as np
@@ -36,18 +37,36 @@ def _get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tens
 class LLaDAGenerator(BaseGenerator):
     name = "LLaDA-8B-Instruct"
 
-    def __init__(self, model_id: str = "GSAI-ML/LLaDA-8B-Instruct"):
+    def __init__(
+        self,
+        model_id: str = "GSAI-ML/LLaDA-8B-Instruct",
+        target_device: str | None = None,
+    ):
         self.model_id = model_id
+        # None  → Accelerate picks automatically (device_map="auto")
+        # "cuda:0" etc. → entire model on that one device
+        self._target_device = target_device
         self.model = None
         self.tokenizer = None
-        self.device = None
-        # Stores final sequence after generate_steps() finishes
+        self.device: str = "cpu"
         self._final_x: torch.Tensor | None = None
         self._prompt_len: int = 0
 
-    # ── lifecycle ────────────────────────────────────────────────────────
     def load(self) -> None:
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        n_gpus = torch.cuda.device_count()
+
+        if self._target_device is not None:
+            self.device = self._target_device
+        elif n_gpus > 0:
+            self.device = "cuda:0"
+        else:
+            self.device = "cpu"
+
+        # NOTE: We deliberately do NOT pass device_map here.
+        # LLaDA uses trust_remote_code and its LLaDAModelLM class does not
+        # implement `all_tied_weights_keys`, which transformers >= 4.45 requires
+        # inside infer_auto_device_map. LLaDA-8B (~16 GB bfloat16) fits on a
+        # single A10 (24 GB), so a plain .to(device) is sufficient.
         self.model = (
             AutoModel.from_pretrained(
                 self.model_id,
@@ -62,12 +81,12 @@ class LLaDAGenerator(BaseGenerator):
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_id, trust_remote_code=True
         )
-        print(f"[LLaDA] model loaded on {self.device}")
+        print(f"[LLaDA] loaded on {self.device}")
+
 
     def is_loaded(self) -> bool:
         return self.model is not None
 
-    # ── tokenisation ─────────────────────────────────────────────────────
     def encode_chat(self, messages: list[dict]) -> torch.Tensor:
         text = self.tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=False
@@ -78,7 +97,6 @@ class LLaDAGenerator(BaseGenerator):
     def decode_ids(self, ids: list[int], skip_special: bool = False) -> str:
         return self.tokenizer.decode(ids, skip_special_tokens=skip_special)
 
-    # ── generation (yields per step) ─────────────────────────────────────
     @torch.no_grad()
     def generate_steps(
         self,
@@ -96,9 +114,7 @@ class LLaDAGenerator(BaseGenerator):
 
         x = torch.full(
             (prompt_ids.shape[0], prompt_len + gen_length),
-            MASK_ID,
-            dtype=torch.long,
-            device=self.device,
+            MASK_ID, dtype=torch.long, device=self.device,
         )
         x[:, :prompt_len] = prompt_ids.clone()
         prompt_index = x != MASK_ID
@@ -107,19 +123,17 @@ class LLaDAGenerator(BaseGenerator):
         num_blocks = gen_length // block_length
         assert steps % num_blocks == 0
         steps_per_block = steps // num_blocks
-
         global_step = 0
 
         for num_block in range(num_blocks):
             blk_start = prompt_len + num_block * block_length
-            blk_end = prompt_len + (num_block + 1) * block_length
+            blk_end   = prompt_len + (num_block + 1) * block_length
             block_mask_index = x[:, blk_start:blk_end] == MASK_ID
             num_transfer = _get_num_transfer_tokens(block_mask_index, steps_per_block)
 
             for i in range(steps_per_block):
                 mask_index = x == MASK_ID
 
-                # ── forward pass ────────────────────────────────
                 if cfg_scale > 0.0:
                     un_x = x.clone()
                     un_x[prompt_index] = MASK_ID
@@ -130,11 +144,14 @@ class LLaDAGenerator(BaseGenerator):
                 else:
                     logits = self.model(x).logits
 
-                # attention from last layer
+                # With device_map the output may be on the last layer's GPU;
+                # normalise back to self.device so all subsequent ops are on
+                # the same device as x.
+                logits = logits.to(self.device)
+
                 attn = self.model.model.transformer.blocks[-1]._attn_weights
                 attn = attn.detach().cpu() if attn is not None else None
 
-                # ── sampling ────────────────────────────────────
                 logits_noisy = _add_gumbel_noise(logits, temperature)
                 x0 = torch.argmax(logits_noisy, dim=-1)
 
@@ -149,7 +166,6 @@ class LLaDAGenerator(BaseGenerator):
                     raise NotImplementedError(remasking)
 
                 x0_p[:, blk_end:] = -np.inf
-
                 old_x = x.clone()
                 x0 = torch.where(mask_index, x0, x)
                 confidence = torch.where(mask_index, x0_p, -np.inf)
@@ -160,7 +176,6 @@ class LLaDAGenerator(BaseGenerator):
                     transfer_index[j, sel] = True
                 x[transfer_index] = x0[transfer_index]
 
-                # ── build StepResult ────────────────────────────
                 gen_ids = x[0, prompt_len:].cpu().tolist()
                 old_gen = old_x[0, prompt_len:].cpu().tolist()
 
@@ -193,7 +208,12 @@ class LLaDAGenerator(BaseGenerator):
             self._final_x[:, self._prompt_len:], skip_special_tokens=True
         )[0]
 
-    def strip_eos(self, prompt: torch.Tensor) -> torch.Tensor:
-        """Remove EOS tokens so the conversation can continue."""
-        return prompt[prompt != EOS_ID].unsqueeze(0)
+    def get_final_token_ids(self) -> list[int]:
+        """Full sequence (prompt + generation) without EOS — for multi-turn context."""
+        if self._final_x is None:
+            return []
+        x = self._final_x[0]
+        return x[x != EOS_ID].cpu().tolist()
 
+    def strip_eos(self, prompt: torch.Tensor) -> torch.Tensor:
+        return prompt[prompt != EOS_ID].unsqueeze(0)

@@ -69,3 +69,7 @@ class BaseGenerator(abc.ABC):
     def get_final_text(self) -> str:
         """Return the fully decoded answer after generation has finished."""
 
+    @abc.abstractmethod
+    def get_final_token_ids(self) -> list[int]:
+        """Full token ID sequence (prompt + generation, EOS stripped) for multi-turn."""
+
