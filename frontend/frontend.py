@@ -605,4 +605,4 @@ async def index():
 
 # launch
 if __name__ in {"__main__", "__mp_main__"}:
-    ui.run(title="AI-Timescales", port=8080, reload=True)
+    ui.run(title="AI-Timescales", host="0.0.0.0", port=8080, reload=False)
