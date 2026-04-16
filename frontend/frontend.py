@@ -166,19 +166,24 @@ async def play_one(wav: bytes) -> None:
     await ui.run_javascript(PLAY_ONE_JS.replace("{b64}", f'"{b64}"'))
 
 
+# Special tokens that should never be sonified
+_SKIP_TOKENS = {"<|endoftext|>", "<|eot_id|>", "<eos>", "<s>", "</s>", "<pad>"}
+
 async def play_many_diffusion(decoded_tokens: List[str], mask_positions: List[int]) -> None:
-    """Fetch TTS for revealed tokens concurrently, then play all in sync via Web Audio API."""
+    """Fetch TTS for revealed, non-special tokens concurrently, play all simultaneously."""
     import base64, asyncio as _aio
     mask_set = set(mask_positions)
 
-    # Fetch TTS for all non-mask tokens concurrently
     async def entry(idx: int, tok: str):
         if idx in mask_set:
-            return {"mask": True}
+            return None  # masks are silent — no white noise
+        tok_stripped = tok.strip()
+        if not tok_stripped or tok_stripped in _SKIP_TOKENS:
+            return None  # skip EOS and other special tokens
         wav = await fetch_tts(tok)
         if wav:
             return {"mask": False, "b64": base64.b64encode(wav).decode()}
-        return None  # skip silent tokens
+        return None
 
     tasks = [entry(i, t) for i, t in enumerate(decoded_tokens)]
     results = await _aio.gather(*tasks)
@@ -239,11 +244,36 @@ async def index():
 
         # settings
         with ui.row().classes("w-full items-end gap-4 flex-wrap"):
-            gen_length  = ui.number("Gen length", value=8,  min=8,   max=256, step=8 ).classes("w-28")
-            n_steps     = ui.number("Steps",      value=8,   min=1,   max=128, step=1 ).classes("w-24")
+            gen_length  = ui.number("Gen length", value=64, min=8,   max=256, step=8 ).classes("w-28")
+            n_steps     = ui.number("Steps",      value=64,  min=1,   max=256, step=1 ).classes("w-24")
             temperature = ui.number("Temp",       value=0.0, min=0.0, max=2.0, step=0.1, format="%.1f").classes("w-24")
             block_len   = ui.number("Block len",  value=32,  min=8,   max=256, step=8 ).classes("w-28")
             tts_toggle  = ui.switch("TTS", value=True)
+
+        constraint_note = ui.label("").classes("text-xs text-yellow-400")
+
+        def _snap_constraints() -> None:
+            gl = max(8, int(gen_length.value or 8))
+            bl = max(8, int(block_len.value or 8))
+            st = max(1, int(n_steps.value or 1))
+
+            # block_length must divide gen_length — find largest divisor of gl that is <= bl
+            if gl % bl != 0:
+                bl = max(d for d in range(1, gl + 1) if gl % d == 0 and d <= bl)
+                block_len.value = bl
+
+            num_blocks = gl // bl
+            # steps must be a multiple of num_blocks
+            if st % num_blocks != 0:
+                st = max(num_blocks, round(st / num_blocks) * num_blocks)
+                n_steps.value = st
+
+            constraint_note.text = f"blocks={num_blocks}, steps/block={st // num_blocks}"
+
+        gen_length.on("update:model-value", lambda _: _snap_constraints())
+        block_len.on("update:model-value", lambda _: _snap_constraints())
+        n_steps.on("update:model-value", lambda _: _snap_constraints())
+        _snap_constraints()
 
         ui.separator()
 
@@ -364,7 +394,8 @@ async def index():
                     "POST", f"{BACKEND}/generate", json=payload
                 ) as resp:
                     if resp.status_code != 200:
-                        gen_status.text = f"⚠ Server error {resp.status_code}"
+                        body = await resp.aread()
+                        gen_status.text = f"⚠ Server error {resp.status_code}: {body.decode()[:120]}"
                         return False
                     event_type: str | None = None
                     async for line in resp.aiter_lines():
@@ -390,7 +421,9 @@ async def index():
             gen_status.text = "⚠ Lost connection to backend."
             mark_offline("connection lost during generation")
         except Exception as exc:
-            gen_status.text = f"⚠ {exc}"
+            import traceback
+            gen_status.text = f"⚠ {type(exc).__name__}: {exc}"
+            print(traceback.format_exc(), flush=True)
         return False
 
     # shared generation helpers
