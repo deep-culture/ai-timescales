@@ -78,13 +78,13 @@ async def lifespan(app: FastAPI):
     if n_gpus >= 2:
         # Dedicated GPU per model: LLaDA on cuda:0, Llama on cuda:1
         registry: dict[str, BaseGenerator] = {
-            #"LLaDA-8B-Instruct":              LLaDAGenerator(target_device="cuda:0"),
+            "LLaDA-8B-Instruct":              LLaDAGenerator(target_device="cuda:0"),
             "Llama-3.2-1B-Instruct": LlamaGenerator(target_device="cuda:1"),
         }
     else:
         # Single GPU or CPU – Accelerate distributes each model with device_map="auto"
         registry = {
-            #"LLaDA-8B-Instruct":              LLaDAGenerator(),
+            "LLaDA-8B-Instruct":              LLaDAGenerator(),
             "Llama-3.2-1B-Instruct":          LlamaGenerator(),
         }
 
