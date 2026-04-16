@@ -319,7 +319,7 @@ async def index():
             if state["ar_model"] is None and ar_model:
                 state["ar_model"] = ar_model[0]
             if state["diffusion_model"] is None and diffusion_model:
-                state["diffusion_model"] = ar_model[0]
+                state["diffusion_model"] = diffusion_model[0]
 
             # Refresh panel name labels
             ar_name_label.text = state["ar_model"] or "No AR model loaded"
