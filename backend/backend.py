@@ -10,8 +10,6 @@ import json
 import threading
 import wave
 
-from fastapi import Depends, Security
-from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
 from pathlib import Path
 import os
@@ -22,6 +20,18 @@ load_dotenv(HERE / ".env")
 if not os.environ.get("HF_HOME"):
     os.environ["HF_HOME"] = str(HERE / "huggingface")
 
+# ── FastAPI imports first, before anything that uses them ─────────────────
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+
+import numpy as np
+import torch
+from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi.security import APIKeyHeader
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, Field
+
+# ── auth ──────────────────────────────────────────────────────────────────
 API_KEY = os.environ.get("API_KEY")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
 
@@ -29,17 +39,8 @@ async def verify_key(key: str = Security(api_key_header)) -> None:
     if not API_KEY or key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API key")
 
-
 print(f"[server] HF_HOME = {os.environ['HF_HOME']}", flush=True)
 
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator
-
-import numpy as np
-import torch
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, Field
 
 from inference import LLaDAGenerator, LlamaGenerator
 from inference.base import BaseGenerator

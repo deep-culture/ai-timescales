@@ -23,11 +23,18 @@ import json
 from dataclasses import dataclass
 from typing import Callable, Coroutine, List
 
+from dotenv import load_dotenv
+from pathlib import Path
+import os
+
+# Load from backend .env (single source of truth)
+load_dotenv(Path(__file__).parent.parent / "backend" / ".env")
+
+BACKEND = os.environ.get("BACKEND_URL", "http://localhost:8000")
+API_KEY = os.environ.get("API_KEY", "")
+
 import httpx
 from nicegui import ui
-
-BACKEND = "http://localhost:8000"
-API_KEY = os.environ.get("API_KEY", "")   # same key, loaded from
 
 def _client(**kwargs) -> httpx.AsyncClient:
     """httpx client pre-loaded with the API key header."""
