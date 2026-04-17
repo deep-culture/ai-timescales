@@ -1,24 +1,26 @@
 <template>
   <svg
     class="heartbeat"
-    viewBox="0 0 1000 60"
+    viewBox="0 0 1000 120"
     preserveAspectRatio="none"
     xmlns="http://www.w3.org/2000/svg"
   >
-    <path v-if="path" :d="path" fill="none" stroke="#fff" stroke-width="1.5" vector-effect="non-scaling-stroke" />
+    <path v-if="path" :d="path" fill="none" :stroke="lineColor" stroke-width="4" vector-effect="non-scaling-stroke" />
   </svg>
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { ref, computed } from 'vue'
 
 const props = defineProps<{
   points: { x: number; y: number }[]
 }>()
 
 const W = 1000
-const H = 60
+const H = 120
 const PAD = 3
+
+const lineColor = ref('#832161')
 
 const path = computed(() => {
   const pts = props.points
@@ -45,8 +47,8 @@ const path = computed(() => {
 <style scoped>
 .heartbeat {
   width: 100%;
-  height: 60px;
-  background: #000;
+  height: 120px;
+  background: transparent;
   border-radius: 6px;
   display: block;
 }

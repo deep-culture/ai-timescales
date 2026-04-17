@@ -1,40 +1,59 @@
 <template>
   <header>
-    <span class="title">AI-Timescales</span>
+    <span class="title"><strong>AI timescales</strong></span>
     <span :class="['dot', online ? 'on' : 'off']">●</span>
     <span class="status-text">{{ statusText }}</span>
   </header>
 
   <main>
-    <div class="last-msg">{{ lastMsg }}</div>
+
+    <!-- params -->
+    <div class="control-box intro-text">
+      <div>How can we listen to the rhythms in deep learning?</div>
+      <div>How do different operations traverse timescales?</div>
+      <div>What rhythms ‘get through’ to other temporal strata?</div>
+    </div>
+    <div class="control-box params">
+      <span><label>Gen length <input type="number" v-model.number="genLength" min="8" max="256" step="8" @change="snapConstraints()" /></label></span>
+      <span><label>Steps <input type="number" v-model.number="steps" min="1" max="256" step="1" @change="snapConstraints()" /></label></span>
+      <span><label>Temp <input type="number" v-model.number="temperature" min="0" max="2" step="0.1" /></label></span>
+      <span><label>Block len <input type="number" v-model.number="blockLength" min="8" max="256" step="8" @change="snapConstraints()" /></label></span>
+      <span class="note">{{ constraintNote }}</span>
+    </div>
+    <!-- scales   -->
+    <div class="control-box scales">
+      <span class="scales-header">Timescale</span>
+      <button :class="['btn', 'toggle', timescale === 'inference' ? 'toggle-active' : '']" @click="switchTimescale('inference')">Inference</button>
+      <button :class="['btn', 'toggle', timescale === 'attention' ? 'toggle-active' : '']" @click="switchTimescale('attention')">Attention</button>
+    </div>
+    <!-- input + buttons -->
+    <div class="control-box controls last-controls">
+      <div>
+        <input class="prompt-input" v-model="userInput" placeholder="Insert prompt" @keydown.enter="onEnter" />
+      </div>
+      <template v-if="timescale === 'inference'">
+        <button class="btn ar" :disabled="busy || !online || !arModel" @click="runAR">Autoregress</button>
+        <button class="btn diff" :disabled="busy || !online || !diffusionModel" @click="runDiffuse">Diffuse</button>
+      </template>
+      <template v-else>
+        <button class="btn ar" :disabled="busy || !online || !arModel" @click="nextARStep">Next autoregression</button>
+        <button class="btn diff" :disabled="busy || !online || !diffusionModel" @click="nextDiffStep">Next denoising step</button>
+      </template>
+    </div>
+
+    <div class="gen-status">{{ genStatus }}</div>
 
     <!-- heartbeat graph -->
     <HeartbeatGraph :points="heartbeat" />
 
     <!-- single merged output box -->
     <div class="output" ref="outputEl">
-      <span v-for="(tok, i) in tokens" :key="i" :class="['tok', tok.cls]">{{ tok.text }}</span>
+      <span v-for="(tok, i) in tokens" :key="i"
+        :class="['tok', tok.cls, (timescale === 'attention' && i === selectedTokenIdx) ? 'tok-selected' : '']"
+        @click="onTokenClick(i)"
+        :style="timescale === 'attention' ? { cursor: 'pointer' } : {}"
+      >{{ tok.text }}</span>
     </div>
-
-    <!-- params -->
-    <div class="params">
-      <label>Gen length <input type="number" v-model.number="genLength" min="8" max="256" step="8" @change="snapConstraints()" /></label>
-      <label>Steps <input type="number" v-model.number="steps" min="1" max="256" step="1" @change="snapConstraints()" /></label>
-      <label>Temp <input type="number" v-model.number="temperature" min="0" max="2" step="0.1" /></label>
-      <label>Block len <input type="number" v-model.number="blockLength" min="8" max="256" step="8" @change="snapConstraints()" /></label>
-      <span class="note">{{ constraintNote }}</span>
-    </div>
-
-    <!-- input + buttons -->
-    <div class="controls">
-      <input class="msg-input" v-model="userInput" placeholder="Type your message…" @keydown.enter="onEnter" />
-      <button class="btn ar" :disabled="busy || !online || !arModel" @click="runAR">Autoregress</button>
-      <button class="btn diff" :disabled="busy || !online || !diffusionModel" @click="runDiffuse">Diffuse</button>
-      <button class="btn stop" @click="stopOrClear">{{ busy ? 'Stop' : 'Clear' }}</button>
-      <button :class="['btn', 'tts', ttsEnabled ? 'tts-on' : 'tts-off']" @click="ttsEnabled = !ttsEnabled" title="Toggle TTS">{{ ttsEnabled ? '🔊' : '🔇' }}</button>
-    </div>
-
-    <div class="gen-status">{{ genStatus }}</div>
 
     <!-- raw step output -->
     <pre class="raw-step" v-if="lastStep">{{ lastStepJson }}</pre>
@@ -53,6 +72,8 @@ interface StepEvent {
   decoded_tokens: string[]
   mask_positions: number[]
   newly_revealed: number[]
+  attention?: number[] | number[][]   // 1D (AR last row) or 2D (diffusion gen-portion)
+  prompt_length?: number
 }
 
 interface HeartbeatPoint { x: number; y: number }
@@ -62,7 +83,6 @@ const online = ref(false)
 const busy = ref(false)
 const statusText = ref('Connecting…')
 const genStatus = ref('')
-const lastMsg = ref('—')
 const userInput = ref('')
 
 const arModel = ref<string | null>(null)
@@ -83,6 +103,22 @@ const steps = ref(64)
 const temperature = ref(0)
 const blockLength = ref(32)
 const ttsEnabled = ref(true)
+const ttsVolume = ref(1)
+
+// ── timescale mode ───────────────────────────────────────────────────────
+const timescale = ref<'inference' | 'attention'>('inference')
+const selectedTokenIdx = ref(0)
+
+// AR attention mode state
+const arAttnTokens = reactive<string[]>([])   // accumulated generated token texts
+const arAttnIds = ref<number[]>([])           // full token IDs for continue_only
+const arLastAttnRow = ref<number[] | null>(null)
+
+// Diffusion attention mode state
+const diffStepBuffer = reactive<StepEvent[]>([])
+const diffStepIdx = ref(0)
+const diffGenerationDone = ref(false)
+const diffCurrentAttn = ref<number[][] | null>(null)
 
 const constraintNote = computed(() => {
   const gl = genLength.value
@@ -166,6 +202,7 @@ async function streamGenerate(
         block_length: blockLength.value,
         temperature: temperature.value,
         tts: false,   // TTS handled client-side via display queue
+        return_attention: timescale.value === 'attention',
       }),
       signal: abortCtrl.signal,
     })
@@ -224,12 +261,11 @@ function getAudioCtx(): AudioContext {
   return _audioCtx
 }
 
-// Fetch TTS for a list of token texts in parallel; returns decoded AudioBuffers
-async function fetchTtsBuffers(tokenTexts: string[]): Promise<AudioBuffer[]> {
-  const valid = tokenTexts.filter(t => t.trim() && !SKIP_TOKENS.has(t.trim()))
-  if (!valid.length) return []
+// Fetch TTS for a list of token texts; returns decoded AudioBuffers with their pan positions
+async function fetchTtsBuffers(tokenTexts: string[], pans: number[]): Promise<{ buffer: AudioBuffer; pan: number }[]> {
   const ctx = getAudioCtx()
-  const results = await Promise.all(valid.map(async text => {
+  const results = await Promise.all(tokenTexts.map(async (text, i) => {
+    if (!text.trim() || SKIP_TOKENS.has(text.trim())) return null
     try {
       const res = await fetch('/api/tts', {
         method: 'POST',
@@ -238,22 +274,29 @@ async function fetchTtsBuffers(tokenTexts: string[]): Promise<AudioBuffer[]> {
       })
       if (!res.ok || res.status === 204) return null
       const ab = await res.arrayBuffer()
-      return await ctx.decodeAudioData(ab)
+      const buffer = await ctx.decodeAudioData(ab)
+      return { buffer, pan: pans[i] ?? 0 }
     } catch { return null }
   }))
-  return results.filter((b): b is AudioBuffer => b !== null)
+  return results.filter((b): b is { buffer: AudioBuffer; pan: number } => b !== null)
 }
 
-// Schedule a set of already-decoded AudioBuffers to play simultaneously
-function playAudioBuffers(bufs: AudioBuffer[], startOffset = 0.03): void {
-  if (!bufs.length) return
+// Schedule a set of already-decoded AudioBuffers to play simultaneously with individual panning
+function playAudioBuffers(items: { buffer: AudioBuffer; pan: number }[], startOffset = 0.03): void {
+  if (!items.length) return
   const ctx = getAudioCtx()
   const startTime = ctx.currentTime + startOffset
-  for (const buf of bufs) {
+  const gainNode = ctx.createGain()
+  gainNode.gain.value = ttsVolume.value
+  gainNode.connect(ctx.destination)
+  for (const { buffer, pan } of items) {
     try {
       const src = ctx.createBufferSource()
-      src.buffer = buf
-      src.connect(ctx.destination)
+      src.buffer = buffer
+      const panner = ctx.createStereoPanner()
+      panner.pan.value = pan
+      src.connect(panner)
+      panner.connect(gainNode)
       src.start(startTime)
     } catch { /* best-effort */ }
   }
@@ -263,7 +306,7 @@ function playAudioBuffers(bufs: AudioBuffer[], startOffset = 0.03): void {
 // and the render function to call once audio is ready.
 interface QueuedStep {
   ev: StepEvent
-  audioProm: Promise<AudioBuffer[]>
+  audioProm: Promise<{ buffer: AudioBuffer; pan: number }[]>
   renderFn: (ev: StepEvent) => void
 }
 
@@ -282,23 +325,308 @@ async function drainDisplayQueue(): Promise<void> {
   _draining = true
   while (_displayQueue.length > 0) {
     const { ev, audioProm, renderFn } = _displayQueue.shift()!
-    const bufs = await audioProm   // wait for this step's TTS (may already be done)
-    playAudioBuffers(bufs)         // schedule audio — returns immediately
+    const items = await audioProm
+    playAudioBuffers(items)
     pushHeartbeat(ev)
-    renderFn(ev)                   // render tokens — same JS tick as audio scheduling
+    renderFn(ev)
     scrollOutput()
+    await nextTick()                          // ← let Vue render before next step
+    await new Promise(r => setTimeout(r, 0)) // ← yield to the event loop
   }
   _draining = false
 }
 
+
 // Enqueue a step: fire TTS immediately, push to queue, kick drain.
 function enqueueStep(ev: StepEvent, renderFn: (ev: StepEvent) => void): void {
+  const totalLen = genLength.value
   const tokenTexts = ev.newly_revealed.map(i => ev.decoded_tokens[i])
+  // Compute pan per token based on its position in the full sequence: left → centre → right
+  const pans = ev.newly_revealed.map(i => {
+    const t = totalLen > 1 ? i / (totalLen - 1) : 0.5   // 0..1
+    return (t * 2) - 1   // -1 (left) .. 0 (centre) .. +1 (right)
+  })
   const audioProm = ttsEnabled.value
-    ? fetchTtsBuffers(tokenTexts)
+    ? fetchTtsBuffers(tokenTexts, pans)
     : Promise.resolve([])
   _displayQueue.push({ ev, audioProm, renderFn })
   drainDisplayQueue()  // no-op if already draining; drain loop picks up new item
+}
+
+// ── timescale switching ──────────────────────────────────────────────────
+function switchTimescale(mode: 'inference' | 'attention') {
+  timescale.value = mode
+  // Reset state when switching
+  tokens.length = 0
+  heartbeat.length = 0
+  lastStep.value = null
+  genStatus.value = ''
+  resetDisplayQueue()
+  // Reset attention-mode state
+  arAttnTokens.length = 0
+  arAttnIds.value = []
+  arLastAttnRow.value = null
+  diffStepBuffer.length = 0
+  diffStepIdx.value = 0
+  diffGenerationDone.value = false
+  diffCurrentAttn.value = null
+  selectedTokenIdx.value = 0
+}
+
+// ── pan helper ───────────────────────────────────────────────────────────
+function panForIndex(i: number, total: number): number {
+  const t = total > 1 ? i / (total - 1) : 0.5
+  return (t * 2) - 1
+}
+
+// ── volume-aware TTS playback ────────────────────────────────────────────
+async function fetchTtsBuffersWithVolumes(
+  tokenTexts: string[],
+  pans: number[],
+  volumes: number[],
+): Promise<{ buffer: AudioBuffer; pan: number; volume: number }[]> {
+  const ctx = getAudioCtx()
+  const results = await Promise.all(tokenTexts.map(async (text, i) => {
+    if (!text.trim() || SKIP_TOKENS.has(text.trim())) return null
+    try {
+      const res = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: text.trim() }),
+      })
+      if (!res.ok || res.status === 204) return null
+      const ab = await res.arrayBuffer()
+      const buffer = await ctx.decodeAudioData(ab)
+      return { buffer, pan: pans[i] ?? 0, volume: volumes[i] ?? 1 }
+    } catch { return null }
+  }))
+  return results.filter((b): b is { buffer: AudioBuffer; pan: number; volume: number } => b !== null)
+}
+
+function playAudioBuffersWithVolumes(items: { buffer: AudioBuffer; pan: number; volume: number }[], startOffset = 0.03): number {
+  if (!items.length) return 0
+  const ctx = getAudioCtx()
+  const startTime = ctx.currentTime + startOffset
+  let maxDuration = 0
+  for (const { buffer, pan, volume } of items) {
+    try {
+      const src = ctx.createBufferSource()
+      src.buffer = buffer
+      const gainNode = ctx.createGain()
+      gainNode.gain.value = volume * ttsVolume.value
+      const panner = ctx.createStereoPanner()
+      panner.pan.value = pan
+      src.connect(panner)
+      panner.connect(gainNode)
+      gainNode.connect(ctx.destination)
+      src.start(startTime)
+      maxDuration = Math.max(maxDuration, buffer.duration)
+    } catch { /* best-effort */ }
+  }
+  return maxDuration
+}
+
+// ── single-step fetch helper ─────────────────────────────────────────────
+async function fetchSteps(body: Record<string, unknown>): Promise<{ steps: StepEvent[]; finalIds: number[]; finalText: string }> {
+  const res = await fetch('/api/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok || !res.body) return { steps: [], finalIds: [], finalText: '' }
+  const reader = res.body.getReader()
+  const dec = new TextDecoder()
+  let buf = ''
+  let eventType = ''
+  const collectedSteps: StepEvent[] = []
+  let finalIds: number[] = []
+  let finalText = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += dec.decode(value, { stream: true })
+    const lines = buf.split('\n')
+    buf = lines.pop()!
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      if (trimmed.startsWith('event:')) eventType = trimmed.slice(6).trim()
+      else if (trimmed.startsWith('data:')) {
+        const data = JSON.parse(trimmed.slice(5).trim())
+        if (eventType === 'step') collectedSteps.push(data as StepEvent)
+        else if (eventType === 'done') { finalIds = data.final_token_ids ?? []; finalText = data.final_text ?? '' }
+      }
+    }
+  }
+  return { steps: collectedSteps, finalIds, finalText }
+}
+
+// ── AR attention mode ────────────────────────────────────────────────────
+async function nextARStep() {
+  if (busy.value || !online.value || !arModel.value) return
+  const msg = userInput.value.trim()
+  if (!msg && arAttnIds.value.length === 0) return
+  busy.value = true
+  genStatus.value = '⟳ next AR token…'
+
+  const isFirst = arAttnIds.value.length === 0
+  const { steps: stepEvts, finalIds } = await fetchSteps({
+    model: arModel.value,
+    messages: isFirst ? [{ role: 'user', content: msg }] : [],
+    prev_token_ids: arAttnIds.value,
+    gen_length: 1,
+    steps: 1,
+    block_length: 1,
+    temperature: temperature.value,
+    tts: false,
+    return_attention: true,
+    continue_only: !isFirst,
+  })
+
+  if (!stepEvts.length) { busy.value = false; genStatus.value = '⚠ no step'; return }
+  const ev = stepEvts[0]
+  arAttnIds.value = finalIds
+  const newText = ev.decoded_tokens[0] ?? ''
+  arAttnTokens.push(newText)
+  arLastAttnRow.value = (ev.attention as number[]) ?? null
+  lastStep.value = ev
+
+  // Render all accumulated tokens
+  tokens.length = 0
+  for (let i = 0; i < arAttnTokens.length; i++) {
+    tokens.push({
+      text: arAttnTokens[i] || '\u00a0',
+      cls: i === arAttnTokens.length - 1 ? 'tok-new' : 'tok-old',
+    })
+  }
+  scrollOutput()
+
+  // TTS: play new token first
+  const total = arAttnTokens.length
+  const newBufs = await fetchTtsBuffersWithVolumes([newText], [panForIndex(total - 1, total)], [1])
+  let dur = 0
+  if (newBufs.length) {
+    dur = playAudioBuffersWithVolumes(newBufs)
+    await new Promise(r => setTimeout(r, dur * 1000 + 80))
+  }
+
+  // Then replay previous tokens with attention-mapped volume
+  if (arLastAttnRow.value && total > 1) {
+    const attnRow = arLastAttnRow.value
+    // Previous gen tokens are at the end of the attention row before the new token
+    // attnRow.length = prompt_len + 1 (the new token)
+    // Previously generated tokens occupy the last (total-1) positions before the new token
+    const prevCount = total - 1
+    const offset = attnRow.length - 1 - prevCount  // start of prev gen tokens in attnRow
+    const rawVols = []
+    for (let i = 0; i < prevCount; i++) rawVols.push(attnRow[offset + i] ?? 0)
+    const maxV = Math.max(...rawVols, 1e-9)
+    const normVols = rawVols.map(v => v / maxV)
+
+    const prevTexts = arAttnTokens.slice(0, prevCount)
+    const prevPans = prevTexts.map((_, i) => panForIndex(i, total))
+    const bufs = await fetchTtsBuffersWithVolumes(prevTexts, prevPans, normVols)
+    playAudioBuffersWithVolumes(bufs)
+  }
+
+  genStatus.value = `✓ token ${total}`
+  busy.value = false
+}
+
+// ── Diffusion attention mode ─────────────────────────────────────────────
+async function nextDiffStep() {
+  if (busy.value || !online.value || !diffusionModel.value) return
+
+  // If buffer is exhausted or empty, start a new generation
+  if (diffStepIdx.value >= diffStepBuffer.length) {
+    const msg = userInput.value.trim()
+    if (!msg) return
+    busy.value = true
+    genStatus.value = '⟳ generating all steps…'
+    diffStepBuffer.length = 0
+    diffStepIdx.value = 0
+    diffGenerationDone.value = false
+    selectedTokenIdx.value = 0
+
+    const { steps: allSteps } = await fetchSteps({
+      model: diffusionModel.value,
+      messages: [{ role: 'user', content: msg }],
+      prev_token_ids: [],
+      gen_length: genLength.value,
+      steps: steps.value,
+      block_length: blockLength.value,
+      temperature: temperature.value,
+      tts: false,
+      return_attention: true,
+    })
+
+    for (const s of allSteps) diffStepBuffer.push(s)
+    diffGenerationDone.value = true
+
+    if (!diffStepBuffer.length) { busy.value = false; genStatus.value = '⚠ no steps'; return }
+  } else {
+    busy.value = true
+  }
+
+  // Show the current step
+  const ev = diffStepBuffer[diffStepIdx.value]
+  diffStepIdx.value++
+  diffCurrentAttn.value = (ev.attention as number[][] | undefined) ?? null
+  lastStep.value = ev
+
+  // Render diffusion tokens
+  renderDiffusion(ev)
+  scrollOutput()
+
+  // TTS: play selected token first, then all others with attention-mapped volume
+  await playDiffusionAttentionTTS(ev)
+
+  genStatus.value = `step ${diffStepIdx.value}/${diffStepBuffer.length}`
+  busy.value = false
+}
+
+async function playDiffusionAttentionTTS(ev: StepEvent) {
+  const attn = diffCurrentAttn.value
+  const maskSet = new Set(ev.mask_positions)
+  const sel = selectedTokenIdx.value
+  const total = ev.decoded_tokens.length
+
+  // Play selected token at full volume
+  if (!maskSet.has(sel)) {
+    const selText = ev.decoded_tokens[sel]
+    const selBufs = await fetchTtsBuffersWithVolumes([selText], [panForIndex(sel, total)], [1])
+    if (selBufs.length) {
+      const dur = playAudioBuffersWithVolumes(selBufs)
+      await new Promise(r => setTimeout(r, dur * 1000 + 80))
+    }
+  }
+
+  // Play all other non-masked tokens with attention-mapped volume
+  const otherTexts: string[] = []
+  const otherPans: number[] = []
+  const otherVols: number[] = []
+  for (let i = 0; i < total; i++) {
+    if (i === sel || maskSet.has(i)) continue
+    otherTexts.push(ev.decoded_tokens[i])
+    otherPans.push(panForIndex(i, total))
+    const vol = attn ? (attn[sel]?.[i] ?? 0) : 0.5
+    otherVols.push(vol)
+  }
+  const maxV = Math.max(...otherVols, 1e-9)
+  const normVols = otherVols.map(v => v / maxV)
+
+  const bufs = await fetchTtsBuffersWithVolumes(otherTexts, otherPans, normVols)
+  playAudioBuffersWithVolumes(bufs)
+}
+
+// ── token click handler ──────────────────────────────────────────────────
+function onTokenClick(i: number) {
+  if (timescale.value !== 'attention') return
+  selectedTokenIdx.value = i
+  // Re-play TTS for diffusion if we have a current step
+  if (diffCurrentAttn.value && lastStep.value && lastStep.value.mask_positions) {
+    playDiffusionAttentionTTS(lastStep.value)
+  }
 }
 
 // ── token rendering helpers ──────────────────────────────────────────────
@@ -337,9 +665,7 @@ function scrollOutput() {
 async function runAR() {
   if (busy.value || !online.value || !arModel.value) return
   const msg = userInput.value.trim(); if (!msg) return
-  userInput.value = ''
   busy.value = true
-  lastMsg.value = msg
   genStatus.value = `⟳ ${arModel.value}…`
   tokens.length = 0
   heartbeat.length = 0
@@ -359,9 +685,7 @@ async function runAR() {
 async function runDiffuse() {
   if (busy.value || !online.value || !diffusionModel.value) return
   const msg = userInput.value.trim(); if (!msg) return
-  userInput.value = ''
   busy.value = true
-  lastMsg.value = msg
   genStatus.value = `⟳ ${diffusionModel.value}…`
   tokens.length = 0;
   heartbeat.length = 0
@@ -380,9 +704,7 @@ async function runDiffuse() {
 async function runBoth() {
   if (busy.value || !online.value) return
   const msg = userInput.value.trim(); if (!msg) return
-  userInput.value = ''
   busy.value = true
-  lastMsg.value = msg
   tokens.length = 0
   heartbeat.length = 0
   lastStep.value = null
@@ -422,170 +744,161 @@ async function stopOrClear() {
     tokens.length = 0
     heartbeat.length = 0
     lastStep.value = null
-    lastMsg.value = '—'
     genStatus.value = ''
     prevIds.ar = []; prevIds.diffusion = []
   }
 }
 
-function onEnter() { runBoth() }
+function onEnter() {
+  if (timescale.value === 'inference') runBoth()
+  else nextARStep()  // Enter in attention mode → next AR token
+}
 </script>
 
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;600;700&display=swap');
 
-
+:root {
+  --font-sans: 'Lexend', system-ui, sans-serif;
+  --color-background: #99B2DD;
+  --color-text: #00010;
+  --color-primary: #832161;
+  --color-secondary: #bdceea;
+  --color-accent: #ADFC92;
+  --color-warning: #df0000;
+}
 
 * {
-  margin: 0; padding: 0; box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
 }
+
 body {
-  background: #0f172a; color: #e2e8f0; font-family: system-ui, sans-serif;
+  background-color: var(--color-background);
+  font-family: var(--font-sans);
+  color: var(--color-text);
+  margin: 1rem;
 }
+
 header {
-  display: flex; align-items: center; gap: 8px; padding: 8px 16px; background: #1e293b;
-}
-.title {
-  font-size: 18px; font-weight: 700;
-}
-.dot {
-  font-size: 14px;
-}
-.dot.on {
-  color: #4ade80;
-}
-.dot.off {
-  color: #f87171;
-}
-.status-text {
-  font-size: 12px; color: #94a3b8;
 }
 
-main {
-  max-width: 900px;
-  margin: 0 auto;
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.last-msg {
-  font-size: 13px;
-  color: #cbd5e1;
-  background: #1e293b;
-  border-radius: 6px;
-  padding: 6px 12px;
+header span {
+  padding: .2rem;
+  background-color: var(--color-primary);
+  color: var(--color-secondary);
 }
 
+header .dot.on {
+  color: var(--color-accent);
+}
+header .dot.off {
+  color: var(--color-warning);
+}
+
+.control-box {
+  padding: 1rem;
+  border: 4px solid var(--color-primary);
+  border-bottom: none;
+  text-align: center;
+}
+
+.last-controls {
+  border-bottom: 4px solid var(--color-primary);
+}
+
+.intro-text {
+  font-size: 1.2rem;
+  color: var(--color-primary);
+}
+
+.params span {
+  color: var(--color-primary);
+  padding: .2rem;
+}
+
+input {
+  background-color: var(--color-secondary);
+  border: none;
+  padding: .4rem;
+  font-family: var(--font-sans);
+  color: var(--color-primary);
+  font-weight: bold;
+  text-align: center;
+}
+
+.prompt-input {
+  width: 100%;
+  height: 5rem;
+  font-size: 1.2rem;
+  border-bottom: 4px solid var(--color-primary);
+}
+
+.prompt-input::placeholder {
+  color: var(--color-background);
+  font-weight: normal;
+}
+
+button {
+  background-color: var(--color-secondary);
+  color: var(--color-primary);
+  border: none;
+  border-bottom: 4px solid var(--color-primary);
+  font-family: var(--font-sans);
+  padding: .4rem;
+  margin: .4rem;
+  font-size: 1.2rem;
+  text-transform: uppercase;
+}
+
+button:hover {
+  background-color: var(--color-accent);
+  cursor: pointer;
+}
 
 .output {
-  min-height: 200px;
-  max-height: 400px;
-  overflow-y: auto;
-  background: #020617;
-  border: 1px solid #334155;
-  border-radius: 6px;
-  padding: 10px;
-  font-family: monospace;
-  line-height: 1.6;
-  white-space: pre-wrap;
-  word-break: break-all;
-}
-.tok {
-  padding: 1px 2px;
-  border-radius: 3px;
-  background: rgba(255,255,255,0.05);
-  display: inline;
-}
-.tok-new {
-  color: #fbbf24;
-}
-.tok-old {
-  color: #94a3b8;
-}
-.tok-mask {
-  color: #475569;
+  min-height: 5em;
+  padding: 1rem;
+  font-size: 3rem;
+  line-height: 4rem;
 }
 
-.params {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  flex-wrap: wrap;
-  font-size: 13px;
-}
-.params label {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-.params input {
-  width: 64px;
-  background: #1e293b;
-  border: 1px solid #334155;
-  color: #e2e8f0;
-  border-radius: 4px;
-  padding: 3px 6px;
-}
-.note {
-  font-size: 11px; color: #eab308;
+.output span {
+  margin: .2rem;
+  color: var(--color-primary);
+  background-color: var(--color-accent);
 }
 
-.controls {
-  display: flex; gap: 6px;
-}
-.msg-input {
-  flex: 1;
-  background: #1e293b;
-  border: 1px solid #334155;
-  color: #e2e8f0;
-  border-radius: 4px;
-  padding: 6px 10px;
-  font-size: 14px;
-}
-.btn {
-  padding: 6px 14px;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 13px;
-  font-weight: 600;
-  color: #fff;
-}
-.btn:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-.btn.ar {
-  background: #7c3aed;
-}
-.btn.diff {
-  background: #0d9488;
-}
-.btn.stop {
-  background: #dc2626;
-}
-.btn.tts-on {
-  background: #1d4ed8;
-}
-.btn.tts-off {
-  background: #334155;
+input::-webkit-outer-spin-button,
+input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
-.gen-status {
-  font-size: 12px; color: #64748b;
+/* Firefox */
+input[type=number] {
+  -moz-appearance: textfield;
 }
 
-.raw-step {
-  background: #020617;
-  border: 1px solid #334155;
-  border-radius: 6px;
-  padding: 10px;
-  font-family: monospace;
-  font-size: 11px;
-  color: #64748b;
-  max-height: 200px;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  word-break: break-all;
+.scales-header {
+  font-weight: bold;
+  color: var(--color-primary);
+  margin-right: 0.5rem;
+}
+
+.toggle {
+  font-size: 1rem;
+  padding: 0.3rem 0.8rem;
+}
+
+.toggle-active {
+  background-color: var(--color-accent);
+  border-bottom-color: var(--color-primary);
+}
+
+.tok-selected {
+  outline: 3px solid var(--color-primary);
+  outline-offset: -1px;
 }
 </style>

@@ -99,7 +99,7 @@ class LlamaGenerator(BaseGenerator):
         eos_id = self.tokenizer.eos_token_id
 
         for step in range(gen_length):
-            output = self.model(input_ids)
+            output = self.model(input_ids, output_attentions=True)
             # output.logits may be on a different GPU with device_map;
             # bring to self.device for consistent ops.
             next_token_logits = output.logits[:, -1, :].to(self.device)
@@ -116,12 +116,18 @@ class LlamaGenerator(BaseGenerator):
                 dim=1,
             )
 
+            # Last-layer attention: (1, n_heads, seq, seq) → mean over heads → (seq, seq)
+            attn: torch.Tensor | None = None
+            if output.attentions:
+                attn = output.attentions[-1][0].mean(0).detach().cpu()
+
             decoded: List[str] = [self.decode_ids([tid]) for tid in generated]
 
             yield StepResult(
                 step_index=step,
                 token_ids=list(generated),
                 decoded_tokens=decoded,
+                attention=attn,
                 mask_positions=[],                    # AR has no masking
                 newly_revealed=[len(generated) - 1],  # the token just appended
             )

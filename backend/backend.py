@@ -125,6 +125,11 @@ class GenerateRequest(BaseModel):
     cfg_scale: float = 0.0
     remasking: str = "low_confidence"
     tts: bool = True
+    return_attention: bool = True
+    continue_only: bool = Field(
+        default=False,
+        description="If true, use prev_token_ids as the full prompt directly (skip chat template).",
+    )
 
 
 # ── SSE helpers ─────────────────────────────────────────────────────────────
@@ -207,13 +212,17 @@ async def generate(req: GenerateRequest) -> StreamingResponse:
     _cancel.clear()  # reset flag for this new generation
 
     # ── build the prompt tensor server-side ────────────────────────────────
-    new_ids = gen.encode_chat(req.messages)   # (1, L) – always includes BOS
-    if req.prev_token_ids:
-        # Multi-turn: prepend accumulated context, strip BOS from new turn
-        prev = torch.tensor([req.prev_token_ids], device=gen.device)
-        prompt = torch.cat([prev, new_ids[:, 1:]], dim=1)
+    if req.continue_only and req.prev_token_ids:
+        # Attention mode: continue directly from accumulated token IDs
+        prompt = torch.tensor([req.prev_token_ids], device=gen.device)
     else:
-        prompt = new_ids
+        new_ids = gen.encode_chat(req.messages)   # (1, L) – always includes BOS
+        if req.prev_token_ids:
+            # Multi-turn: prepend accumulated context, strip BOS from new turn
+            prev = torch.tensor([req.prev_token_ids], device=gen.device)
+            prompt = torch.cat([prev, new_ids[:, 1:]], dim=1)
+        else:
+            prompt = new_ids
 
     async def event_stream() -> AsyncGenerator[str, None]:
         loop = asyncio.get_running_loop()
@@ -241,8 +250,8 @@ async def generate(req: GenerateRequest) -> StreamingResponse:
 
         loop.run_in_executor(None, _run_gen)
 
-        _SKIP_TOKENS = {"<|endoftext|>", "<|eot_id|>", "<eos>", "<s>", "</s>", "<pad>"}
-
+        #_SKIP_TOKENS = {"<|endoftext|>", "<|eot_id|>", "<eos>", "<s>", "</s>", "<pad>"}
+        _SKIP_TOKENS = {}
         while True:
             item = await q.get()
             if item is None:
@@ -276,6 +285,24 @@ async def generate(req: GenerateRequest) -> StreamingResponse:
                         _base64mod.b64encode(w).decode("ascii") if w else ""
                         for w in wavs
                     ]
+            # ── include attention if requested ────────────────────────────
+            if req.return_attention and item.attention is not None:
+                attn = item.attention
+                # LLaDA: (B, n_heads, T, T) → mean over batch+heads → (T, T)
+                # Llama: already (T, T) after mean over heads in generator
+                if attn.dim() == 4:
+                    attn = attn[0].mean(0)   # (n_heads, T, T) → (T, T)
+                elif attn.dim() == 3:
+                    attn = attn.mean(0)      # (n_heads, T, T) → (T, T)
+                # attn is now (T, T)
+                pl = gen._prompt_len
+                step_data["prompt_length"] = pl
+                if not item.mask_positions:
+                    # AR: send only the last row (new token's attention)
+                    step_data["attention"] = attn[-1].float().tolist()
+                else:
+                    # Diffusion: send gen-portion matrix only (gen_len × gen_len)
+                    step_data["attention"] = attn[pl:, pl:].float().tolist()
             yield _sse("step", step_data)
 
         # ── done or cancelled ──────────────────────────────────────────────
