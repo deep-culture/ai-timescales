@@ -58,7 +58,7 @@ class LLaDAGenerator(BaseGenerator):
         if self._target_device is not None:
             self.device = self._target_device
         elif n_gpus > 0:
-            self.device = "cuda:0"
+            self.device = "cuda:1"
         else:
             self.device = "cpu"
 
