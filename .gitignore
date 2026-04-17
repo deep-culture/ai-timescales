@@ -1,4 +1,6 @@
 .venv
 .idea
 .env
+frontend/.env
+backend/.env
 huggingface/

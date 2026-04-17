@@ -26,18 +26,10 @@ from typing import AsyncGenerator
 
 import numpy as np
 import torch
-from fastapi import Depends, FastAPI, HTTPException, Security
-from fastapi.security import APIKeyHeader
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-# ── auth ──────────────────────────────────────────────────────────────────
-API_KEY = os.environ.get("API_KEY")
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
-
-async def verify_key(key: str = Security(api_key_header)) -> None:
-    if not API_KEY or key != API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid API key")
 
 print(f"[server] HF_HOME = {os.environ['HF_HOME']}", flush=True)
 
@@ -75,18 +67,26 @@ async def lifespan(app: FastAPI):
     n_gpus = torch.cuda.device_count()
     print(f"[server] {n_gpus} CUDA GPU(s) detected", flush=True)
 
+    skip_ar        = os.environ.get("DO_NOT_LOAD_AR", "false").strip().lower() == "true"
+    skip_diffusion = os.environ.get("DO_NOT_LOAD_DIFFUSION", "false").strip().lower() == "true"
+
     if n_gpus >= 2:
-        # Dedicated GPU per model: LLaDA on cuda:0, Llama on cuda:1
-        registry: dict[str, BaseGenerator] = {
-            "LLaDA-8B-Instruct":              LLaDAGenerator(target_device="cuda:0"),
-            "Llama-3.2-1B-Instruct": LlamaGenerator(target_device="cuda:1"),
-        }
+        registry: dict[str, BaseGenerator] = {}
+        if not skip_diffusion:
+            registry["LLaDA-8B-Instruct"]     = LLaDAGenerator(target_device="cuda:0")
+        if not skip_ar:
+            registry["Llama-3.2-1B-Instruct"] = LlamaGenerator(target_device="cuda:1")
     else:
-        # Single GPU or CPU – Accelerate distributes each model with device_map="auto"
-        registry = {
-            "LLaDA-8B-Instruct":              LLaDAGenerator(),
-            "Llama-3.2-1B-Instruct":          LlamaGenerator(),
-        }
+        registry = {}
+        if not skip_diffusion:
+            registry["LLaDA-8B-Instruct"]     = LLaDAGenerator()
+        if not skip_ar:
+            registry["Llama-3.2-1B-Instruct"] = LlamaGenerator()
+
+    if skip_ar:
+        print("[server] DO_NOT_LOAD_AR=true — skipping Llama", flush=True)
+    if skip_diffusion:
+        print("[server] DO_NOT_LOAD_DIFFUSION=true — skipping LLaDA", flush=True)
 
     loop = asyncio.get_running_loop()
     for name, gen in registry.items():
@@ -100,6 +100,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AI Timescales Inference Server", lifespan=lifespan)
+
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ── request schema ─────────────────────────────────────────────────────────
 class GenerateRequest(BaseModel):
@@ -137,7 +145,7 @@ async def list_models() -> list[str]:
     return list(_GENERATORS.keys())
 
 
-@app.post("/stop", dependencies=[Depends(verify_key)])
+@app.post("/stop")
 async def stop_generation() -> dict:
     """Signal the active generation to stop after its current step."""
     _cancel.set()
@@ -178,7 +186,7 @@ def _synth_wav(text: str, speed: float, voice: str) -> bytes | None:
     return result
 
 
-@app.post("/tts", dependencies=[Depends(verify_key)])
+@app.post("/tts")
 async def tts(req: TTSRequest) -> Response:
     """Synthesise text → WAV audio (cached). Returns 204 if text is empty/TTS unavailable."""
     loop = asyncio.get_running_loop()
@@ -188,7 +196,7 @@ async def tts(req: TTSRequest) -> Response:
     return Response(content=wav, media_type="audio/wav")
 
 
-@app.post("/generate", dependencies=[Depends(verify_key)])
+@app.post("/generate")
 async def generate(req: GenerateRequest) -> StreamingResponse:
     if req.model not in _GENERATORS:
         raise HTTPException(status_code=404, detail=f"Unknown model '{req.model}'")

@@ -34,17 +34,86 @@ BACKEND = os.environ.get("BACKEND_URL", "http://localhost:8000")
 API_KEY = os.environ.get("API_KEY", "")
 
 import httpx
-from nicegui import ui
+from nicegui import ui, app
+
+# Inject Chart.js once for all pages
+app.add_static_files("/static", str(Path(__file__).parent))
+
+CHARTJS_HEAD = """
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+<style>
+  .heartbeat-canvas { display:block; width:100% !important; height:80px !important; background:#000; border-radius:6px; }
+</style>
+"""
+
+INIT_CHART_JS = """
+(function(canvasId, chartVar) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    if (window[chartVar]) { window[chartVar].destroy(); }
+    window[chartVar] = new Chart(canvas.getContext('2d'), {
+        type: 'line',
+        data: {
+            datasets: [{
+                data: [],
+                borderColor: 'rgba(255,255,255,0.9)',
+                borderWidth: 1.5,
+                pointRadius: 0,
+                tension: 0.3,
+                fill: false,
+            }]
+        },
+        options: {
+            animation: false,
+            responsive: false,
+            parsing: false,
+            plugins: { legend: { display: false }, tooltip: { enabled: false } },
+            scales: {
+                x: {
+                    type: 'linear',
+                    display: false,
+                },
+                y: {
+                    type: 'linear',
+                    display: false,
+                    min: 0,
+                }
+            }
+        }
+    });
+})("{canvas_id}", "{chart_var}");
+"""
+
+PUSH_POINT_JS = """
+(function(chartVar, x, y) {
+    const ch = window[chartVar];
+    if (!ch) return;
+    ch.data.datasets[0].data.push({x, y});
+    // keep x-axis tight to data range
+    const xs = ch.data.datasets[0].data.map(p => p.x);
+    ch.options.scales.x.min = Math.min(...xs);
+    ch.options.scales.x.max = Math.max(...xs);
+    ch.update('none');
+})("{chart_var}", {x}, {y});
+"""
+
+RESET_CHART_JS = """
+(function(chartVar) {
+    const ch = window[chartVar];
+    if (!ch) return;
+    ch.data.datasets[0].data = [];
+    ch.update('none');
+})("{chart_var}");
+"""
 
 def _client(**kwargs) -> httpx.AsyncClient:
     """httpx client pre-loaded with the API key header."""
     headers = {"X-API-Key": API_KEY}
     return httpx.AsyncClient(headers=headers, **kwargs)
 
-CLR_MASK     = "#444"
-CLR_NEW      = "#4ade80"   # green  – just generated / just revealed
-CLR_EXISTING = "#60a5fa"   # blue   – already present
-
+def load_css() -> str:
+    with open(os.path.join(base_path, 'assets', 'stylesheet.css'), 'r', encoding='utf-8') as file:
+        return file.read()
 
 # SSE wire type
 @dataclass
@@ -196,14 +265,17 @@ async def play_many_diffusion(decoded_tokens: List[str], mask_positions: List[in
 # page
 @ui.page("/")
 async def index():
+    ui.add_head_html(CHARTJS_HEAD)
     # Per-page state – no stale globals
     state = {
         "busy":           False,
-        "online":         False,   # backend reachable?
-        "ar_model":    None,    # populated by first successful check_server
+        "online":         False,
+        "ar_model":    None,
         "diffusion_model":    None,
         "ar_prev_ids": [],
         "diffusion_prev_ids": [],
+        "ar_t0": 0.0,
+        "diffusion_t0": 0.0,
     }
 
     # header
@@ -225,6 +297,7 @@ async def index():
                 ar_name_label = ui.label("—").classes(
                     "text-xs font-mono text-purple-400 font-semibold tracking-wide"
                 )
+                ui.html('<canvas id="ar-heartbeat" class="heartbeat-canvas"></canvas>')
                 ar_scroll = ui.scroll_area().classes(
                     "w-full border border-purple-900/60 rounded-lg bg-slate-950"
                 ).style("height:340px")
@@ -236,6 +309,7 @@ async def index():
                 diffusion_name_label_text = ui.label("—").classes(
                     "text-xs font-mono text-emerald-400 font-semibold tracking-wide"
                 )
+                ui.html('<canvas id="diffusion-heartbeat" class="heartbeat-canvas"></canvas>')
                 diffusion_scroll = ui.scroll_area().classes(
                     "w-full border border-emerald-900/60 rounded-lg bg-slate-950"
                 ).style("height:340px")
@@ -274,6 +348,17 @@ async def index():
         block_len.on("update:model-value", lambda _: _snap_constraints())
         n_steps.on("update:model-value", lambda _: _snap_constraints())
         _snap_constraints()
+
+        # initialise heartbeat charts (canvas must exist in DOM first)
+        async def _init_charts() -> None:
+            await ui.run_javascript(
+                INIT_CHART_JS.replace("{canvas_id}", "ar-heartbeat").replace("{chart_var}", "arChart")
+            )
+            await ui.run_javascript(
+                INIT_CHART_JS.replace("{canvas_id}", "diffusion-heartbeat").replace("{chart_var}", "diffusionChart")
+            )
+
+        ui.timer(0.1, _init_charts, once=True)
 
         ui.separator()
 
@@ -426,6 +511,20 @@ async def index():
             print(traceback.format_exc(), flush=True)
         return False
 
+    # heartbeat helpers
+    import time as _time
+
+    async def _reset_chart(chart_var: str) -> None:
+        await ui.run_javascript(RESET_CHART_JS.replace("{chart_var}", chart_var))
+
+    async def _push_point(chart_var: str, t0: float, n_unmasked: int) -> None:
+        x = round(_time.monotonic() - t0, 3)
+        js = (PUSH_POINT_JS
+              .replace("{chart_var}", chart_var)
+              .replace("{x}", str(x))
+              .replace("{y}", str(n_unmasked)))
+        await ui.run_javascript(js)
+
     # shared generation helpers
     def begin(msg: str) -> None:
         """Shared setup: set busy, update buttons/stop, clear status."""
@@ -473,8 +572,12 @@ async def index():
 
         if state["ar_model"]:
             gen_status.text = f"⟳ {state['ar_model']}…"
+            state["ar_t0"] = _time.monotonic()
+            await _reset_chart("arChart")
 
             async def ar_step(ev: StepEvent) -> None:
+                n_unmasked = len(ev.decoded_tokens) - len(ev.mask_positions)
+                await _push_point("arChart", state["ar_t0"], n_unmasked)
                 wav = None
                 if do_tts and ev.newly_revealed:
                     tok = ev.decoded_tokens[ev.newly_revealed[0]]
@@ -518,15 +621,19 @@ async def index():
 
         if state["diffusion_model"]:
             gen_status.text = f"⟳ {state['diffusion_model']}…"
+            state["diffusion_t0"] = _time.monotonic()
+            await _reset_chart("diffusionChart")
 
             async def diffusion_step(ev: StepEvent) -> None:
+                n_unmasked = len(ev.decoded_tokens) - len(ev.mask_positions)
+                await _push_point("diffusionChart", state["diffusion_t0"], n_unmasked)
                 if do_tts:
-                    await play_many_diffusion(ev.decoded_tokens, ev.mask_positions)  # fetch + start
+                    await play_many_diffusion(ev.decoded_tokens, ev.mask_positions)
                 hdr = (
                     f"<span style='color:#555;font-size:11px;font-family:monospace'>"
                     f"step {ev.step_index + 1}</span><br>"
                 )
-                diffusion_html.content = hdr + render_diffusion(ev)  # reveal after audio starts
+                diffusion_html.content = hdr + render_diffusion(ev)
                 diffusion_scroll.scroll_to(percent=1.0)
 
             async def diffusion_done(data: dict) -> None:
@@ -563,8 +670,12 @@ async def index():
 
         if state["ar_model"] and ok:
             gen_status.text = f"⟳ {state['ar_model']}…"
+            state["ar_t0"] = _time.monotonic()
+            await _reset_chart("arChart")
 
             async def both_ar_step(ev: StepEvent) -> None:
+                n_unmasked = len(ev.decoded_tokens) - len(ev.mask_positions)
+                await _push_point("arChart", state["ar_t0"], n_unmasked)
                 wav = None
                 if do_tts and ev.newly_revealed:
                     tok = ev.decoded_tokens[ev.newly_revealed[0]]
@@ -592,8 +703,12 @@ async def index():
 
         if state["diffusion_model"] and ok:
             gen_status.text = f"⟳ {state['diffusion_model']}…"
+            state["diffusion_t0"] = _time.monotonic()
+            await _reset_chart("diffusionChart")
 
             async def both_diffusion_step(ev: StepEvent) -> None:
+                n_unmasked = len(ev.decoded_tokens) - len(ev.mask_positions)
+                await _push_point("diffusionChart", state["diffusion_t0"], n_unmasked)
                 hdr = (
                     f"<span style='color:#555;font-size:11px;font-family:monospace'>"
                     f"step {ev.step_index + 1}</span><br>"
