@@ -70,19 +70,22 @@ async def lifespan(app: FastAPI):
 
     skip_ar        = os.environ.get("DO_NOT_LOAD_AR", "false").strip().lower() == "true"
     skip_diffusion = os.environ.get("DO_NOT_LOAD_DIFFUSION", "false").strip().lower() == "true"
+    ar_model_id    = os.environ.get("AR_MODEL", "meta-llama/Llama-3.2-1B-Instruct").strip()
+    ar_display_name = ar_model_id.split("/")[-1]  # e.g. "Llama-3.2-1B-Instruct"
+    print(f"[server] AR model: {ar_model_id}", flush=True)
 
     if n_gpus >= 2:
         registry: dict[str, BaseGenerator] = {}
         if not skip_diffusion:
-            registry["LLaDA-8B-Instruct"]     = LLaDAGenerator(target_device="cuda:0")
+            registry["LLaDA-8B-Instruct"] = LLaDAGenerator(target_device="cuda:0")
         if not skip_ar:
-            registry["Llama-3.2-1B-Instruct"] = LlamaGenerator(target_device="cuda:1")
+            registry[ar_display_name] = LlamaGenerator(model_id=ar_model_id, target_device="cuda:1")
     else:
         registry = {}
         if not skip_diffusion:
-            registry["LLaDA-8B-Instruct"]     = LLaDAGenerator()
+            registry["LLaDA-8B-Instruct"] = LLaDAGenerator()
         if not skip_ar:
-            registry["Llama-3.2-1B-Instruct"] = LlamaGenerator()
+            registry[ar_display_name] = LlamaGenerator(model_id=ar_model_id)
 
     if skip_ar:
         print("[server] DO_NOT_LOAD_AR=true — skipping Llama", flush=True)

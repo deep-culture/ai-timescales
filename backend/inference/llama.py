@@ -22,6 +22,7 @@ class LlamaGenerator(BaseGenerator):
         target_device: str | None = None,
     ):
         self.model_id = model_id
+        self.name = model_id.split("/")[-1]
         self.hf_token: str | None = (
             hf_token
             or os.environ.get("HF_TOKEN")
