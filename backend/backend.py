@@ -5,28 +5,42 @@ AI-Timescales – FastAPI inference server.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import threading
+import wave
 
 from dotenv import load_dotenv
 from pathlib import Path
 import os
 
-_HERE = Path(__file__).parent.resolve()
-load_dotenv(_HERE / ".env")
+HERE = Path(__file__).parent.resolve()
+load_dotenv(HERE / ".env")
 
 if not os.environ.get("HF_HOME"):
-    os.environ["HF_HOME"] = str(_HERE / "huggingface")
+    os.environ["HF_HOME"] = str(HERE / "huggingface")
 
-print(f"[server] HF_HOME = {os.environ['HF_HOME']}", flush=True)
-
+# ── FastAPI imports first, before anything that uses them ─────────────────
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
+import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi.security import APIKeyHeader
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
+
+# ── auth ──────────────────────────────────────────────────────────────────
+API_KEY = os.environ.get("API_KEY")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
+
+async def verify_key(key: str = Security(api_key_header)) -> None:
+    if not API_KEY or key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+print(f"[server] HF_HOME = {os.environ['HF_HOME']}", flush=True)
+
 
 from inference import LLaDAGenerator, LlamaGenerator
 from inference.base import BaseGenerator
@@ -38,10 +52,26 @@ _cancel = threading.Event()
 # ── model registry (populated in lifespan) ───────────────────────────────
 _GENERATORS: dict[str, BaseGenerator] = {}
 
+# ── TTS pipeline (Kokoro, loaded in lifespan) ────────────────────────────
+_tts_pipeline = None
+_tts_lock = threading.Lock()
+_tts_cache: dict[tuple, bytes] = {}   # (text, speed) → WAV bytes
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Build the model registry based on available GPUs, then load every model."""
+    global _tts_pipeline
+
+    # Load Kokoro TTS (CPU, fast)
+    print("[server] loading Kokoro TTS…", flush=True)
+    try:
+        from kokoro import KPipeline
+        _tts_pipeline = KPipeline(lang_code="a")
+        print("[server] Kokoro TTS ready ✓", flush=True)
+    except Exception as exc:
+        print(f"[server] Kokoro TTS unavailable: {exc}", flush=True)
+
     n_gpus = torch.cuda.device_count()
     print(f"[server] {n_gpus} CUDA GPU(s) detected", flush=True)
 
@@ -107,14 +137,58 @@ async def list_models() -> list[str]:
     return list(_GENERATORS.keys())
 
 
-@app.post("/stop")
+@app.post("/stop", dependencies=[Depends(verify_key)])
 async def stop_generation() -> dict:
     """Signal the active generation to stop after its current step."""
     _cancel.set()
     return {"status": "stopping"}
 
 
-@app.post("/generate")
+# ── TTS schema + helpers ────────────────────────────────────────────────────
+class TTSRequest(BaseModel):
+    text: str
+    speed: float = 1.2
+    voice: str = "af_heart"
+
+
+def _synth_wav(text: str, speed: float, voice: str) -> bytes | None:
+    """Synthesise text → WAV bytes using Kokoro (thread-safe, cached)."""
+    text = text.strip()
+    if not text or _tts_pipeline is None:
+        return None
+    key = (text, speed, voice)
+    if key in _tts_cache:
+        return _tts_cache[key]
+    with _tts_lock:
+        chunks: list[np.ndarray] = []
+        for _, _, audio in _tts_pipeline(text, voice=voice, speed=speed):
+            chunks.append(audio)
+    if not chunks:
+        return None
+    pcm = np.concatenate(chunks)
+    pcm_int16 = (pcm * 32767).clip(-32768, 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(pcm_int16.tobytes())
+    result = buf.getvalue()
+    _tts_cache[key] = result
+    return result
+
+
+@app.post("/tts", dependencies=[Depends(verify_key)])
+async def tts(req: TTSRequest) -> Response:
+    """Synthesise text → WAV audio (cached). Returns 204 if text is empty/TTS unavailable."""
+    loop = asyncio.get_running_loop()
+    wav = await loop.run_in_executor(None, _synth_wav, req.text, req.speed, req.voice)
+    if wav is None:
+        return Response(status_code=204)
+    return Response(content=wav, media_type="audio/wav")
+
+
+@app.post("/generate", dependencies=[Depends(verify_key)])
 async def generate(req: GenerateRequest) -> StreamingResponse:
     if req.model not in _GENERATORS:
         raise HTTPException(status_code=404, detail=f"Unknown model '{req.model}'")
@@ -191,4 +265,10 @@ async def generate(req: GenerateRequest) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("backend:app", host="127.0.0.1", port=8000, reload=False)
+
 
