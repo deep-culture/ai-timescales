@@ -5,6 +5,7 @@ AI-Timescales – FastAPI inference server.
 from __future__ import annotations
 
 import asyncio
+import base64 as _base64mod
 import io
 import json
 import threading
@@ -123,6 +124,7 @@ class GenerateRequest(BaseModel):
     temperature: float = 0.0
     cfg_scale: float = 0.0
     remasking: str = "low_confidence"
+    tts: bool = True
 
 
 # ── SSE helpers ─────────────────────────────────────────────────────────────
@@ -239,6 +241,8 @@ async def generate(req: GenerateRequest) -> StreamingResponse:
 
         loop.run_in_executor(None, _run_gen)
 
+        _SKIP_TOKENS = {"<|endoftext|>", "<|eot_id|>", "<eos>", "<s>", "</s>", "<pad>"}
+
         while True:
             item = await q.get()
             if item is None:
@@ -247,13 +251,32 @@ async def generate(req: GenerateRequest) -> StreamingResponse:
                 yield _sse("error", {"message": str(item)})
                 return
             # item is a StepResult
-            yield _sse("step", {
+            step_data: dict = {
                 "step_index":     item.step_index,
                 "token_ids":      item.token_ids,
                 "decoded_tokens": item.decoded_tokens,
                 "mask_positions": item.mask_positions,
                 "newly_revealed": item.newly_revealed,
-            })
+            }
+            # ── synthesize TTS for newly-revealed tokens (parallel) ───────────
+            if req.tts and item.newly_revealed:
+                tok_texts = [
+                    item.decoded_tokens[i]
+                    for i in item.newly_revealed
+                    if item.decoded_tokens[i].strip()
+                    and item.decoded_tokens[i].strip() not in _SKIP_TOKENS
+                ]
+                if tok_texts:
+                    wavs: list[bytes | None] = await asyncio.gather(*[
+                        loop.run_in_executor(None, _synth_wav, t, 1.2, "af_heart")
+                        for t in tok_texts
+                    ])
+                    # One b64 string per token (None → empty string, filtered on frontend)
+                    step_data["audio_b64"] = [
+                        _base64mod.b64encode(w).decode("ascii") if w else ""
+                        for w in wavs
+                    ]
+            yield _sse("step", step_data)
 
         # ── done or cancelled ──────────────────────────────────────────────
         if _cancel.is_set():

@@ -31,6 +31,7 @@
       <button class="btn ar" :disabled="busy || !online || !arModel" @click="runAR">Autoregress</button>
       <button class="btn diff" :disabled="busy || !online || !diffusionModel" @click="runDiffuse">Diffuse</button>
       <button class="btn stop" @click="stopOrClear">{{ busy ? 'Stop' : 'Clear' }}</button>
+      <button :class="['btn', 'tts', ttsEnabled ? 'tts-on' : 'tts-off']" @click="ttsEnabled = !ttsEnabled" title="Toggle TTS">{{ ttsEnabled ? '🔊' : '🔇' }}</button>
     </div>
 
     <div class="gen-status">{{ genStatus }}</div>
@@ -71,6 +72,8 @@ const tokens = reactive<{ text: string; cls: string }[]>([])
 const heartbeat = reactive<HeartbeatPoint[]>([])
 let t0 = 0
 
+const prevIds = reactive<{ ar: number[]; diffusion: number[] }>({ ar: [], diffusion: [] })
+
 const lastStep = ref<StepEvent | null>(null)
 const lastStepJson = computed(() => lastStep.value ? JSON.stringify(lastStep.value, null, 2) : '')
 
@@ -79,6 +82,7 @@ const genLength = ref(64)
 const steps = ref(64)
 const temperature = ref(0)
 const blockLength = ref(32)
+const ttsEnabled = ref(true)
 
 const constraintNote = computed(() => {
   const gl = genLength.value
@@ -131,6 +135,9 @@ onMounted(() => {
   checkServer()
   pollTimer = window.setInterval(checkServer, 5000)
   snapConstraints()
+  // Warm up AudioContext on first user gesture so it's ready for TTS playback
+  const warmUp = () => { getAudioCtx(); document.removeEventListener('click', warmUp) }
+  document.addEventListener('click', warmUp)
 })
 onUnmounted(() => clearInterval(pollTimer))
 
@@ -158,6 +165,7 @@ async function streamGenerate(
         steps: steps.value,
         block_length: blockLength.value,
         temperature: temperature.value,
+        tts: false,   // TTS handled client-side via display queue
       }),
       signal: abortCtrl.signal,
     })
@@ -203,24 +211,94 @@ async function streamGenerate(
   }
 }
 
-// ── TTS ──────────────────────────────────────────────────────────────────
-async function speakText(text: string): Promise<void> {
-  if (!text.trim()) return
-  try {
-    const res = await fetch('/api/tts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    })
-    if (!res.ok || res.status === 204) return
-    const blob = await res.blob()
-    const url = URL.createObjectURL(blob)
-    const audio = new Audio(url)
-    audio.onended = () => URL.revokeObjectURL(url)
-    audio.play()
-  } catch {
-    // TTS is best-effort; silently ignore errors
+// ── TTS + display queue (Option C: step buffering) ───────────────────────
+// Generation runs freely; TTS fetches fire in parallel; display waits per-step
+// until its audio is ready, then plays + renders simultaneously.
+
+const SKIP_TOKENS = new Set(['<|endoftext|>', '<|eot_id|>', '<eos>', '<s>', '</s>', '<pad>'])
+
+let _audioCtx: AudioContext | null = null
+function getAudioCtx(): AudioContext {
+  if (!_audioCtx || _audioCtx.state === 'closed') _audioCtx = new AudioContext()
+  if (_audioCtx.state === 'suspended') _audioCtx.resume()
+  return _audioCtx
+}
+
+// Fetch TTS for a list of token texts in parallel; returns decoded AudioBuffers
+async function fetchTtsBuffers(tokenTexts: string[]): Promise<AudioBuffer[]> {
+  const valid = tokenTexts.filter(t => t.trim() && !SKIP_TOKENS.has(t.trim()))
+  if (!valid.length) return []
+  const ctx = getAudioCtx()
+  const results = await Promise.all(valid.map(async text => {
+    try {
+      const res = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: text.trim() }),
+      })
+      if (!res.ok || res.status === 204) return null
+      const ab = await res.arrayBuffer()
+      return await ctx.decodeAudioData(ab)
+    } catch { return null }
+  }))
+  return results.filter((b): b is AudioBuffer => b !== null)
+}
+
+// Schedule a set of already-decoded AudioBuffers to play simultaneously
+function playAudioBuffers(bufs: AudioBuffer[], startOffset = 0.03): void {
+  if (!bufs.length) return
+  const ctx = getAudioCtx()
+  const startTime = ctx.currentTime + startOffset
+  for (const buf of bufs) {
+    try {
+      const src = ctx.createBufferSource()
+      src.buffer = buf
+      src.connect(ctx.destination)
+      src.start(startTime)
+    } catch { /* best-effort */ }
   }
+}
+
+// Display queue — each entry holds the step event, its TTS promise (already in-flight),
+// and the render function to call once audio is ready.
+interface QueuedStep {
+  ev: StepEvent
+  audioProm: Promise<AudioBuffer[]>
+  renderFn: (ev: StepEvent) => void
+}
+
+let _displayQueue: QueuedStep[] = []
+let _draining = false
+
+function resetDisplayQueue(): void {
+  _displayQueue = []
+  _draining = false
+}
+
+// Serial drain: processes steps in arrival order, waiting for each step's TTS.
+// New steps pushed during a drain are picked up by the running while-loop.
+async function drainDisplayQueue(): Promise<void> {
+  if (_draining) return
+  _draining = true
+  while (_displayQueue.length > 0) {
+    const { ev, audioProm, renderFn } = _displayQueue.shift()!
+    const bufs = await audioProm   // wait for this step's TTS (may already be done)
+    playAudioBuffers(bufs)         // schedule audio — returns immediately
+    pushHeartbeat(ev)
+    renderFn(ev)                   // render tokens — same JS tick as audio scheduling
+    scrollOutput()
+  }
+  _draining = false
+}
+
+// Enqueue a step: fire TTS immediately, push to queue, kick drain.
+function enqueueStep(ev: StepEvent, renderFn: (ev: StepEvent) => void): void {
+  const tokenTexts = ev.newly_revealed.map(i => ev.decoded_tokens[i])
+  const audioProm = ttsEnabled.value
+    ? fetchTtsBuffers(tokenTexts)
+    : Promise.resolve([])
+  _displayQueue.push({ ev, audioProm, renderFn })
+  drainDisplayQueue()  // no-op if already draining; drain loop picks up new item
 }
 
 // ── token rendering helpers ──────────────────────────────────────────────
@@ -267,12 +345,13 @@ async function runAR() {
   heartbeat.length = 0
   lastStep.value = null
   t0 = performance.now()
+  resetDisplayQueue()
 
-  const { ok, finalIds, finalText } = await streamGenerate(arModel.value, msg, prevIds.ar, (ev) => {
-    pushHeartbeat(ev); renderAR(ev); scrollOutput()
+  const { ok, finalIds } = await streamGenerate(arModel.value, msg, prevIds.ar, (ev) => {
+    enqueueStep(ev, renderAR)
   })
 
-  if (ok) { prevIds.ar = finalIds; speakText(finalText) }
+  if (ok) { prevIds.ar = finalIds }
   genStatus.value = ok ? '✓ Done' : genStatus.value
   busy.value = false
 }
@@ -288,11 +367,12 @@ async function runDiffuse() {
   heartbeat.length = 0
   lastStep.value = null
   t0 = performance.now()
+  resetDisplayQueue()
 
-  const { ok, finalIds, finalText } = await streamGenerate(diffusionModel.value, msg, prevIds.diffusion, (ev) => {
-    pushHeartbeat(ev); renderDiffusion(ev); scrollOutput()
+  const { ok, finalIds } = await streamGenerate(diffusionModel.value, msg, prevIds.diffusion, (ev) => {
+    enqueueStep(ev, renderDiffusion)
   })
-  if (ok) { prevIds.diffusion = finalIds; speakText(finalText) }
+  if (ok) { prevIds.diffusion = finalIds }
   genStatus.value = ok ? '✓ Done' : genStatus.value
   busy.value = false
 }
@@ -307,25 +387,27 @@ async function runBoth() {
   heartbeat.length = 0
   lastStep.value = null
   t0 = performance.now()
+  resetDisplayQueue()
 
   if (arModel.value) {
     genStatus.value = `⟳ ${arModel.value}…`
-    const { ok, finalIds, finalText } = await streamGenerate(arModel.value, msg, prevIds.ar, (ev) => {
-      pushHeartbeat(ev); renderAR(ev); scrollOutput()
+    const { ok, finalIds } = await streamGenerate(arModel.value, msg, prevIds.ar, (ev) => {
+      enqueueStep(ev, renderAR)
     })
-    if (ok) { prevIds.ar = finalIds; speakText(finalText) }
+    if (ok) { prevIds.ar = finalIds }
     if (!ok) { busy.value = false; return }
   }
 
   // reset for diffusion pass
   tokens.length = 0; heartbeat.length = 0; lastStep.value = null; t0 = performance.now()
+  resetDisplayQueue()
 
   if (diffusionModel.value) {
     genStatus.value = `⟳ ${diffusionModel.value}…`
-    const { ok, finalIds, finalText } = await streamGenerate(diffusionModel.value, msg, prevIds.diffusion, (ev) => {
-      pushHeartbeat(ev); renderDiffusion(ev); scrollOutput()
+    const { ok, finalIds } = await streamGenerate(diffusionModel.value, msg, prevIds.diffusion, (ev) => {
+      enqueueStep(ev, renderDiffusion)
     })
-    if (ok) { prevIds.diffusion = finalIds; speakText(finalText) }
+    if (ok) { prevIds.diffusion = finalIds }
     genStatus.value = ok ? '✓ Done' : genStatus.value
   }
   busy.value = false
@@ -334,6 +416,7 @@ async function runBoth() {
 async function stopOrClear() {
   if (busy.value) {
     abortCtrl?.abort()
+    resetDisplayQueue()
     try { await fetch('/api/stop', { method: 'POST' }) } catch {}
   } else {
     tokens.length = 0
@@ -349,6 +432,9 @@ function onEnter() { runBoth() }
 </script>
 
 <style>
+
+
+
 * {
   margin: 0; padding: 0; box-sizing: border-box;
 }
@@ -477,6 +563,12 @@ main {
 }
 .btn.stop {
   background: #dc2626;
+}
+.btn.tts-on {
+  background: #1d4ed8;
+}
+.btn.tts-off {
+  background: #334155;
 }
 
 .gen-status {
