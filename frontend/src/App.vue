@@ -588,12 +588,11 @@ function playAudioBuffers(items: { buffer: AudioBuffer; pan: number }[], startOf
   }
 }
 
-// Display queue — each entry holds the step event, its TTS promise (already in-flight),
-// and the render function to call once audio is ready.
+// Display queue — audioProm is started lazily (1-step lookahead only)
 interface QueuedStep {
   ev: StepEvent
-  audioProm: Promise<{ buffer: AudioBuffer; pan: number }[]>
   renderFn: (ev: StepEvent) => void
+  audioProm?: Promise<{ buffer: AudioBuffer; pan: number }[]>
 }
 
 let _displayQueue: QueuedStep[] = []
@@ -604,15 +603,37 @@ function resetDisplayQueue(): void {
   _draining = false
 }
 
-// Serial drain: waits for each step's TTS, then renders + plays simultaneously.
+function _buildAudioProm(ev: StepEvent): Promise<{ buffer: AudioBuffer; pan: number }[]> {
+  if (!ttsEnabled.value) return Promise.resolve([])
+  const totalLen = genLength.value
+  const tokenTexts = ev.newly_revealed.map(i => ev.decoded_tokens[i])
+  const pans = ev.newly_revealed.map(i => {
+    const t = totalLen > 1 ? i / (totalLen - 1) : 0.5
+    return (t * 2) - 1
+  })
+  return fetchTtsBuffers(tokenTexts, pans)
+}
+
+// Serial drain: 1-step TTS lookahead.
+// Starts TTS for step N while rendering step N-1 — at most one request in-flight,
+// so burst generation never queues up parallel TTS calls.
 async function drainDisplayQueue(): Promise<void> {
   if (_draining) return
   _draining = true
+  // Prime the first item
+  if (_displayQueue.length > 0 && !_displayQueue[0].audioProm) {
+    _displayQueue[0].audioProm = _buildAudioProm(_displayQueue[0].ev)
+  }
   while (_displayQueue.length > 0) {
-    const { ev, audioProm, renderFn } = _displayQueue.shift()!
-    const items = await audioProm          // wait for TTS audio to be decoded
-    pushHeartbeat(ev)
-    renderFn(ev)                           // render tokens at the same moment audio starts
+    const item = _displayQueue.shift()!
+    if (!item.audioProm) item.audioProm = _buildAudioProm(item.ev)
+    // Start TTS for the next item now (pipeline: overlaps with current await)
+    if (_displayQueue.length > 0 && !_displayQueue[0].audioProm) {
+      _displayQueue[0].audioProm = _buildAudioProm(_displayQueue[0].ev)
+    }
+    const items = await item.audioProm
+    pushHeartbeat(item.ev)
+    item.renderFn(item.ev)
     scrollOutput()
     playAudioBuffers(items)
     await nextTick()
@@ -621,22 +642,12 @@ async function drainDisplayQueue(): Promise<void> {
   _draining = false
 }
 
-
-// Enqueue a step: fire TTS immediately, push to queue, kick drain.
+// Enqueue a step: do NOT fire TTS here — the drain controls timing.
 function enqueueStep(ev: StepEvent, renderFn: (ev: StepEvent) => void): void {
-  const totalLen = genLength.value
-  const tokenTexts = ev.newly_revealed.map(i => ev.decoded_tokens[i])
-  // Compute pan per token based on its position in the full sequence: left → centre → right
-  const pans = ev.newly_revealed.map(i => {
-    const t = totalLen > 1 ? i / (totalLen - 1) : 0.5   // 0..1
-    return (t * 2) - 1   // -1 (left) .. 0 (centre) .. +1 (right)
-  })
-  const audioProm = ttsEnabled.value
-    ? fetchTtsBuffers(tokenTexts, pans)
-    : Promise.resolve([])
-  _displayQueue.push({ ev, audioProm, renderFn })
-  drainDisplayQueue()  // no-op if already draining; drain loop picks up new item
+  _displayQueue.push({ ev, renderFn })
+  drainDisplayQueue()
 }
+
 
 // ── timescale switching ──────────────────────────────────────────────────
 function switchTimescale(mode: 'inference' | 'attention') {
