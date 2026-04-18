@@ -983,12 +983,13 @@ async function runAR() {
   t0 = performance.now()
   resetDisplayQueue()
   resetRunMetrics(arModel.value, 'AR')
+  // Never retain context between inference-mode runs — avoids growing GPU allocations
+  prevIds.ar = []
 
-  const { ok, finalIds } = await streamGenerate(arModel.value, msg, prevIds.ar, (ev) => {
+  const { ok } = await streamGenerate(arModel.value, msg, [], (ev) => {
     enqueueStep(ev, renderAR)
   })
 
-  if (ok) { prevIds.ar = finalIds }
   genStatus.value = ok ? '✓ Done' : genStatus.value
   busy.value = false
 }
@@ -1004,11 +1005,12 @@ async function runDiffuse() {
   t0 = performance.now()
   resetDisplayQueue()
   resetRunMetrics(diffusionModel.value, 'diffusion')
+  // Never retain context between inference-mode runs — avoids growing GPU allocations
+  prevIds.diffusion = []
 
-  const { ok, finalIds } = await streamGenerate(diffusionModel.value, msg, prevIds.diffusion, (ev) => {
+  const { ok } = await streamGenerate(diffusionModel.value, msg, [], (ev) => {
     enqueueStep(ev, renderDiffusion)
   })
-  if (ok) { prevIds.diffusion = finalIds }
   genStatus.value = ok ? '✓ Done' : genStatus.value
   busy.value = false
 }
@@ -1022,14 +1024,14 @@ async function runBoth() {
   lastStep.value = null
   t0 = performance.now()
   resetDisplayQueue()
+  prevIds.ar = []; prevIds.diffusion = []
 
   if (arModel.value) {
     genStatus.value = `⟳ ${arModel.value}…`
     resetRunMetrics(arModel.value, 'AR')
-    const { ok, finalIds } = await streamGenerate(arModel.value, msg, prevIds.ar, (ev) => {
+    const { ok } = await streamGenerate(arModel.value, msg, [], (ev) => {
       enqueueStep(ev, renderAR)
     })
-    if (ok) { prevIds.ar = finalIds }
     if (!ok) { busy.value = false; return }
   }
 
@@ -1040,10 +1042,9 @@ async function runBoth() {
   if (diffusionModel.value) {
     genStatus.value = `⟳ ${diffusionModel.value}…`
     resetRunMetrics(diffusionModel.value, 'diffusion')
-    const { ok, finalIds } = await streamGenerate(diffusionModel.value, msg, prevIds.diffusion, (ev) => {
+    const { ok } = await streamGenerate(diffusionModel.value, msg, [], (ev) => {
       enqueueStep(ev, renderDiffusion)
     })
-    if (ok) { prevIds.diffusion = finalIds }
     genStatus.value = ok ? '✓ Done' : genStatus.value
   }
   busy.value = false

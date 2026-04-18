@@ -96,6 +96,12 @@ class LLaDAGenerator(BaseGenerator):
     def decode_ids(self, ids: list[int], skip_special: bool = False) -> str:
         return self.tokenizer.decode(ids, skip_special_tokens=skip_special)
 
+    def free_memory(self) -> None:
+        """Delete cached tensors and flush the CUDA allocator."""
+        self._final_x = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     @torch.no_grad()
     def generate_steps(
         self,
@@ -108,6 +114,7 @@ class LLaDAGenerator(BaseGenerator):
         remasking: str = "low_confidence",
         return_attention: bool = False,
     ) -> Iterator[StepResult]:
+        self.free_memory()  # release previous run's tensors before allocating new ones
 
         prompt_len = prompt_ids.shape[1]
         self._prompt_len = prompt_len

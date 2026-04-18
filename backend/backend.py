@@ -344,6 +344,9 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
             except Exception as exc:  # noqa: BLE001
                 asyncio.run_coroutine_threadsafe(q.put(exc), loop)
             finally:
+                # Free intermediate tensors and defragment the CUDA allocator
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 asyncio.run_coroutine_threadsafe(q.put(None), loop)
 
         loop.run_in_executor(None, _run_gen)

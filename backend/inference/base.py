@@ -75,3 +75,6 @@ class BaseGenerator(abc.ABC):
     def get_final_token_ids(self) -> list[int]:
         """Full token ID sequence (prompt + generation, EOS stripped) for multi-turn."""
 
+    @abc.abstractmethod
+    def free_memory(self) -> None:
+        """Release any cached tensors and free the CUDA allocator cache."""
