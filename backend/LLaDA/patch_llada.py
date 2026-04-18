@@ -94,13 +94,14 @@ def _patched_attention(
 
 def patch_model(model):
     """
-    Patch all transformer blocks in a loaded LLaDA model to expose
+    Patch ONLY the last transformer block in a loaded LLaDA model to expose
     attention weights via block._attn_weights after each forward pass.
+    All other blocks keep their original (fast) attention implementation.
     """
-    for block in model.model.transformer.blocks:
-        block._scaled_dot_product_attention = types.MethodType(
-            _patched_scaled_dot_product_attention, block
-        )
-        block.attention = types.MethodType(_patched_attention, block)
-    print(f"Patched {len(model.model.transformer.blocks)} blocks.")
+    last_block = model.model.transformer.blocks[-1]
+    last_block._scaled_dot_product_attention = types.MethodType(
+        _patched_scaled_dot_product_attention, last_block
+    )
+    last_block.attention = types.MethodType(_patched_attention, last_block)
+    print(f"Patched last block only (of {len(model.model.transformer.blocks)} total).")
     return model

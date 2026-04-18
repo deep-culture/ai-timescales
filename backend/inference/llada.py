@@ -71,8 +71,7 @@ class LLaDAGenerator(BaseGenerator):
             AutoModel.from_pretrained(
                 self.model_id,
                 trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
-                attn_implementation="eager",
+                torch_dtype=torch.bfloat16
             )
             .to(self.device)
             .eval()
