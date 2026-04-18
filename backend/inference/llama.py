@@ -53,6 +53,7 @@ class LlamaGenerator(BaseGenerator):
             torch_dtype=torch.bfloat16,
             device_map=device_map,
             token=self.hf_token,
+            attn_implementation="eager"
         ).eval()
 
         self.tokenizer = AutoTokenizer.from_pretrained(

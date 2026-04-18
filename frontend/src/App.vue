@@ -1,4 +1,16 @@
 <template>
+  <!-- ── Login overlay ─────────────────────────────────────────────────── -->
+  <div v-if="loginRequired && !loggedIn" class="login-overlay">
+    <form class="login-box" @submit.prevent="doLogin">
+      <h2>AI Timescales</h2>
+      <p v-if="loginError" class="login-error">{{ loginError }}</p>
+      <label>Username<input v-model="loginUser" type="text" autocomplete="username" /></label>
+      <label>Password<input v-model="loginPass" type="password" autocomplete="current-password" /></label>
+      <button type="submit" :disabled="loginBusy">Sign in</button>
+    </form>
+  </div>
+
+  <template v-else>
   <header>
     <span class="title"><strong>AI timescales</strong></span>
     <span :class="['dot', online ? 'on' : 'off']">●</span>
@@ -58,12 +70,13 @@
     <!-- raw step output -->
     <pre class="raw-step" v-if="lastStep">{{ lastStepJson }}</pre>
   </main>
+  </template>
 </template>
 
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
-import HeartbeatGraph from './HeartbeatGraph.vue'
+import HeartbeatGraph from './components/HeartbeatGraph.vue'
 
 // ── types ────────────────────────────────────────────────────────────────
 interface StepEvent {
@@ -77,6 +90,45 @@ interface StepEvent {
 }
 
 interface HeartbeatPoint { x: number; y: number }
+
+// ── auth ─────────────────────────────────────────────────────────────────
+const loginRequired = ref(false)
+const loggedIn = ref(false)
+const authToken = ref<string | null>(sessionStorage.getItem('auth_token'))
+const loginUser = ref('')
+const loginPass = ref('')
+const loginError = ref('')
+const loginBusy = ref(false)
+
+if (authToken.value) loggedIn.value = true
+
+function authHeaders(): Record<string, string> {
+  if (authToken.value) return { 'Authorization': `Bearer ${authToken.value}` }
+  return {}
+}
+
+async function doLogin() {
+  loginBusy.value = true
+  loginError.value = ''
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: loginUser.value, password: loginPass.value }),
+    })
+    if (!res.ok) { loginError.value = 'Invalid username or password.'; return }
+    const data = await res.json()
+    authToken.value = data.token
+    sessionStorage.setItem('auth_token', data.token)
+    loggedIn.value = true
+    loginPass.value = ''
+    checkServer()
+  } catch {
+    loginError.value = 'Connection error.'
+  } finally {
+    loginBusy.value = false
+  }
+}
 
 // ── state ────────────────────────────────────────────────────────────────
 const online = ref(false)
@@ -154,7 +206,13 @@ let pollTimer: number | undefined
 
 async function checkServer() {
   try {
-    const r = await fetch('/api/status')
+    const r = await fetch('/api/status', { headers: authHeaders() })
+    if (r.status === 401) {
+      online.value = false
+      statusText.value = 'login required'
+      loggedIn.value = false
+      return
+    }
     const data = await r.json()
     const models: string[] = Object.keys(data.models ?? {})
     online.value = true
@@ -167,7 +225,15 @@ async function checkServer() {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
+  // Check if login is required
+  try {
+    const r = await fetch('/api/auth-config')
+    const data = await r.json()
+    loginRequired.value = data.required
+    if (!data.required) loggedIn.value = true
+  } catch { /* if backend is down, just proceed */ }
+
   checkServer()
   pollTimer = window.setInterval(checkServer, 5000)
   snapConstraints()
@@ -192,7 +258,7 @@ async function streamGenerate(
   try {
     const res = await fetch('/api/generate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({
         model,
         messages: [{ role: 'user', content: msg }],
@@ -269,7 +335,7 @@ async function fetchTtsBuffers(tokenTexts: string[], pans: number[]): Promise<{ 
     try {
       const res = await fetch('/api/tts', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ text: text.trim() }),
       })
       if (!res.ok || res.status === 204) return null
@@ -391,7 +457,7 @@ async function fetchTtsBuffersWithVolumes(
     try {
       const res = await fetch('/api/tts', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ text: text.trim() }),
       })
       if (!res.ok || res.status === 204) return null
@@ -430,7 +496,7 @@ function playAudioBuffersWithVolumes(items: { buffer: AudioBuffer; pan: number; 
 async function fetchSteps(body: Record<string, unknown>): Promise<{ steps: StepEvent[]; finalIds: number[]; finalText: string }> {
   const res = await fetch('/api/generate', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body),
   })
   if (!res.ok || !res.body) return { steps: [], finalIds: [], finalText: '' }
@@ -739,7 +805,7 @@ async function stopOrClear() {
   if (busy.value) {
     abortCtrl?.abort()
     resetDisplayQueue()
-    try { await fetch('/api/stop', { method: 'POST' }) } catch {}
+    try { await fetch('/api/stop', { method: 'POST', headers: authHeaders() }) } catch {}
   } else {
     tokens.length = 0
     heartbeat.length = 0
@@ -900,5 +966,55 @@ input[type=number] {
 .tok-selected {
   outline: 3px solid var(--color-primary);
   outline-offset: -1px;
+}
+
+/* ── login overlay ────────────────────────────────────────────────────── */
+.login-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--color-background);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.login-box {
+  border: 4px solid var(--color-primary);
+  padding: 2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 280px;
+  background: var(--color-background);
+}
+
+.login-box h2 {
+  color: var(--color-primary);
+  font-size: 1.4rem;
+  text-align: center;
+}
+
+.login-box label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  color: var(--color-primary);
+  font-weight: bold;
+}
+
+.login-box input {
+  width: 100%;
+  text-align: left;
+}
+
+.login-error {
+  color: var(--color-warning);
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+pre {
+  display: none;
 }
 </style>

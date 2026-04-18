@@ -46,11 +46,11 @@ API_KEY=your_secret      # shared secret between frontend proxy and backend
 # DO_NOT_LOAD_DIFFUSION=true
 ```
 
-Create `frontend/.env` (if you use API key auth in the proxy):
+Copy `.env-example` into `.env` and set the credentials.
 
-```env
-API_KEY=your_secret
-```
+You'll need a HuggingFace token with access to the [LLaMA 3.2](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) model. Request access on the model page if you don't have it yet.
+
+Set `LOGIN_USER` and `LOGIN_PASSWORD` in `.env` if you want to enable the optional login gate.
 
 ---
 

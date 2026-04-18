@@ -16,7 +16,8 @@ from pathlib import Path
 import os
 
 HERE = Path(__file__).parent.resolve()
-load_dotenv(HERE / ".env")
+ROOT = Path(__file__).parent.parent.resolve()
+load_dotenv(ROOT / ".env")
 
 if not os.environ.get("HF_HOME"):
     os.environ["HF_HOME"] = str(HERE / "huggingface")
@@ -25,11 +26,32 @@ if not os.environ.get("HF_HOME"):
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
+import secrets
+
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import Response, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+
+# ── auth ─────────────────────────────────────────────────────────────────────
+_LOGIN_USER = os.environ.get("LOGIN_USER", "").strip()
+_LOGIN_PASSWORD = os.environ.get("LOGIN_PASSWORD", "").strip()
+AUTH_REQUIRED = bool(_LOGIN_USER and _LOGIN_PASSWORD)
+
+_sessions: set[str] = set()  # active session tokens (in-memory)
+
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+def require_auth(
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> None:
+    """FastAPI dependency – no-op when auth is disabled, 401 otherwise."""
+    if not AUTH_REQUIRED:
+        return
+    if creds is None or creds.credentials not in _sessions:
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
 
 print(f"[server] HF_HOME = {os.environ['HF_HOME']}", flush=True)
@@ -141,9 +163,43 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+# ── auth endpoints (public) ──────────────────────────────────────────────────
+@app.get("/auth-config")
+async def auth_config() -> dict:
+    return {"required": AUTH_REQUIRED}
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/login")
+async def login(req: LoginRequest) -> dict:
+    if not AUTH_REQUIRED:
+        return {"token": None}
+    # Use secrets.compare_digest to prevent timing attacks
+    user_ok = secrets.compare_digest(req.username, _LOGIN_USER)
+    pass_ok = secrets.compare_digest(req.password, _LOGIN_PASSWORD)
+    if not (user_ok and pass_ok):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = secrets.token_hex(32)
+    _sessions.add(token)
+    return {"token": token}
+
+
+@app.post("/logout")
+async def logout(
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> dict:
+    if creds and creds.credentials in _sessions:
+        _sessions.discard(creds.credentials)
+    return {"status": "ok"}
+
+
 # ── endpoints ───────────────────────────────────────────────────────────────
 @app.get("/status")
-async def server_status() -> dict:
+async def server_status(_: None = Depends(require_auth)) -> dict:
     """Richer status: includes which models are loaded and ready."""
     return {
         "status": "ok",
@@ -151,12 +207,12 @@ async def server_status() -> dict:
     }
 
 @app.get("/models")
-async def list_models() -> list[str]:
+async def list_models(_: None = Depends(require_auth)) -> list[str]:
     return list(_GENERATORS.keys())
 
 
 @app.post("/stop")
-async def stop_generation() -> dict:
+async def stop_generation(_: None = Depends(require_auth)) -> dict:
     """Signal the active generation to stop after its current step."""
     _cancel.set()
     return {"status": "stopping"}
@@ -197,7 +253,7 @@ def _synth_wav(text: str, speed: float, voice: str) -> bytes | None:
 
 
 @app.post("/tts")
-async def tts(req: TTSRequest) -> Response:
+async def tts(req: TTSRequest, _: None = Depends(require_auth)) -> Response:
     """Synthesise text → WAV audio (cached). Returns 204 if text is empty/TTS unavailable."""
     loop = asyncio.get_running_loop()
     wav = await loop.run_in_executor(None, _synth_wav, req.text, req.speed, req.voice)
@@ -207,7 +263,7 @@ async def tts(req: TTSRequest) -> Response:
 
 
 @app.post("/generate")
-async def generate(req: GenerateRequest) -> StreamingResponse:
+async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> StreamingResponse:
     if req.model not in _GENERATORS:
         raise HTTPException(status_code=404, detail=f"Unknown model '{req.model}'")
 
