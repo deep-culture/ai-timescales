@@ -118,10 +118,10 @@ class LlamaGenerator(BaseGenerator):
                 dim=1,
             )
 
-            # Last-layer attention: (1, n_heads, seq, seq) → mean over heads → (seq, seq)
+            # Last-layer attention: (1, n_heads, seq, seq) → keep all heads → (n_heads, seq, seq)
             attn: torch.Tensor | None = None
             if output.attentions:
-                attn = output.attentions[-1][0].mean(0).detach().cpu()
+                attn = output.attentions[-1][0].detach().cpu()  # (n_heads, T, T)
 
             decoded: List[str] = [self.decode_ids([tid]) for tid in generated]
 

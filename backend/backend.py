@@ -70,7 +70,27 @@ _GENERATORS: dict[str, BaseGenerator] = {}
 # ── TTS pipeline (Kokoro, loaded in lifespan) ────────────────────────────
 _tts_pipeline = None
 _tts_lock = threading.Lock()
-_tts_cache: dict[tuple, bytes] = {}   # (text, speed) → WAV bytes
+_tts_cache: dict[tuple, bytes] = {}   # (text, speed, voice) → WAV bytes
+_available_voices: list[str] = []     # discovered from disk, in order
+
+REQUIRED_VOICES = ['af_heart', 'af_nicole', 'am_michael', 'bf_alice', 'bm_fable']
+
+
+def _discover_voices() -> list[str]:
+    """Required voices first (in fixed order), then any extras found on disk."""
+    hf_home = Path(os.environ.get("HF_HOME", HERE / "huggingface"))
+    pattern = hf_home / "hub" / "models--hexgrad--Kokoro-82M" / "snapshots"
+    disk_voices: set[str] = set()
+    if pattern.exists():
+        for snap in sorted(pattern.iterdir()):
+            vdir = snap / "voices"
+            if vdir.is_dir():
+                disk_voices = {p.stem for p in vdir.glob("*.pt")}
+                break
+    result = list(REQUIRED_VOICES)
+    for v in sorted(disk_voices - set(REQUIRED_VOICES)):
+        result.append(v)
+    return result
 
 
 @asynccontextmanager
@@ -83,6 +103,15 @@ async def lifespan(app: FastAPI):
     try:
         from kokoro import KPipeline
         _tts_pipeline = KPipeline(lang_code="a")
+        _available_voices[:] = _discover_voices()
+        print(f"[server] preloading {len(REQUIRED_VOICES)} required voices…", flush=True)
+        for v in REQUIRED_VOICES:
+            try:
+                _synth_wav("hi", 1.2, v)
+                print(f"[server]   {v} ✓", flush=True)
+            except Exception as exc:
+                print(f"[server]   {v} failed: {exc}", flush=True)
+        print(f"[server] available voices: {_available_voices}", flush=True)
         print("[server] Kokoro TTS ready ✓", flush=True)
     except Exception as exc:
         print(f"[server] Kokoro TTS unavailable: {exc}", flush=True)
@@ -262,6 +291,12 @@ async def tts(req: TTSRequest, _: None = Depends(require_auth)) -> Response:
     return Response(content=wav, media_type="audio/wav")
 
 
+@app.get("/voices")
+async def list_voices(_: None = Depends(require_auth)) -> list[str]:
+    """Return the list of available Kokoro voice names, in head-assignment order."""
+    return _available_voices
+
+
 @app.post("/generate")
 async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> StreamingResponse:
     if req.model not in _GENERATORS:
@@ -347,21 +382,23 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
             # ── include attention if requested ────────────────────────────
             if req.return_attention and item.attention is not None:
                 attn = item.attention
-                # LLaDA: (B, n_heads, T, T) → mean over batch+heads → (T, T)
-                # Llama: already (T, T) after mean over heads in generator
+                # Normalize to (n_heads, T, T)
                 if attn.dim() == 4:
-                    attn = attn[0].mean(0)   # (n_heads, T, T) → (T, T)
-                elif attn.dim() == 3:
-                    attn = attn.mean(0)      # (n_heads, T, T) → (T, T)
-                # attn is now (T, T)
+                    attn = attn[0]          # (B, n_heads, T, T) → (n_heads, T, T)
+                # attn is now (n_heads, T, T)
+                n_heads = attn.shape[0]
+                mean_attn = attn.mean(0)    # (T, T)
                 pl = gen._prompt_len
                 step_data["prompt_length"] = pl
+                step_data["n_heads"] = n_heads
                 if not item.mask_positions:
-                    # AR: send only the last row (new token's attention)
-                    step_data["attention"] = attn[-1].float().tolist()
+                    # AR: last row per head → (n_heads, T); also send mean for compat
+                    step_data["attention"] = mean_attn[-1].float().tolist()
+                    step_data["attention_heads"] = attn[:, -1, :].float().tolist()
                 else:
-                    # Diffusion: send gen-portion matrix only (gen_len × gen_len)
-                    step_data["attention"] = attn[pl:, pl:].float().tolist()
+                    # Diffusion: gen portion per head → (n_heads, gen_len, gen_len)
+                    step_data["attention"] = mean_attn[pl:, pl:].float().tolist()
+                    step_data["attention_heads"] = attn[:, pl:, pl:].float().tolist()
             yield _sse("step", step_data)
 
         # ── done or cancelled ──────────────────────────────────────────────

@@ -43,32 +43,66 @@
       <div>
         <input class="prompt-input" v-model="userInput" placeholder="Insert prompt" @keydown.enter="onEnter" />
       </div>
-      <template v-if="timescale === 'inference'">
-        <button class="btn ar" :disabled="busy || !online || !arModel" @click="runAR">Autoregress</button>
-        <button class="btn diff" :disabled="busy || !online || !diffusionModel" @click="runDiffuse">Diffuse</button>
-      </template>
-      <template v-else>
-        <button class="btn ar" :disabled="busy || !online || !arModel" @click="nextARStep">Next autoregression</button>
-        <button class="btn diff" :disabled="busy || !online || !diffusionModel" @click="nextDiffStep">Next denoising step</button>
-      </template>
+      <div class="btn-row">
+        <template v-if="timescale === 'inference'">
+          <button class="btn ar" :disabled="busy || !online || !arModel" @click="runAR">Autoregress</button>
+          <button class="btn diff" :disabled="busy || !online || !diffusionModel" @click="runDiffuse">Diffuse</button>
+        </template>
+        <template v-else>
+          <button class="btn ar" :disabled="busy || !online || !arModel" @click="nextARStep">Next autoregression</button>
+          <button class="btn diff" :disabled="busy || !online || !diffusionModel" @click="nextDiffStep">Next denoise</button>
+        </template>
+        <button class="btn stop" :disabled="!busy" @click="stopOrClear" title="Stop inference">&#9632;</button>
+      </div>
+      <!-- head selector — only in attention timescale -->
+      <div v-if="timescale === 'attention'" class="head-row">
+        <div><h2>Select final attention heads</h2></div>
+        <div>
+          <button
+            :class="['head-btn', headAvg ? 'head-active' : '']"
+            @click="toggleAvg()"
+          >avg</button>
+          <button
+            v-for="h in nHeads" :key="h - 1"
+            :class="['head-btn', (!headAvg && selectedHeads.has(h - 1)) ? 'head-active' : '']"
+            @click="toggleHead(h - 1)"
+            :title="headVoice(h - 1)"
+          >{{ h - 1 }}</button>
+          </div>
+      </div>
     </div>
 
     <div class="gen-status">{{ genStatus }}</div>
 
     <!-- heartbeat graph -->
-    <HeartbeatGraph :points="heartbeat" />
+    <HeartbeatGraph
+      v-if="timescale !== 'attention'"
+      :points="heartbeat"
+      :netPoints="netPoints"
+      :stepTimes="stepTimes"
+      :modelLabel="modelLabel"
+    />
 
     <!-- single merged output box -->
     <div class="output" ref="outputEl">
       <span v-for="(tok, i) in tokens" :key="i"
-        :class="['tok', tok.cls, (timescale === 'attention' && i === selectedTokenIdx) ? 'tok-selected' : '']"
+        :class="['tok', tok.cls, isSelectedToken(i) ? 'tok-selected' : '']"
         @click="onTokenClick(i)"
-        :style="timescale === 'attention' ? { cursor: 'pointer' } : {}"
+        :style="{
+          cursor: (timescale === 'attention' && isDiffAttnMode) ? 'pointer' : 'default',
+          filter: (timescale === 'attention' && tokenBlurs[i] !== undefined)
+            ? `blur(${tokenBlurs[i].toFixed(2)}px)` : 'none',
+        }"
       >{{ tok.text }}</span>
     </div>
 
     <!-- raw step output -->
     <pre class="raw-step" v-if="lastStep">{{ lastStepJson }}</pre>
+    <footer>
+      <a href="https://deep-culture.org">
+        <img src="./assets/deep-culture.png">
+      </a>
+    </footer>
   </main>
   </template>
 </template>
@@ -85,7 +119,9 @@ interface StepEvent {
   decoded_tokens: string[]
   mask_positions: number[]
   newly_revealed: number[]
-  attention?: number[] | number[][]   // 1D (AR last row) or 2D (diffusion gen-portion)
+  attention?: number[] | number[][]          // mean: 1D (AR) or 2D (diffusion)
+  attention_heads?: number[][] | number[][][] // per-head: (n_heads,T) or (n_heads,gen,gen)
+  n_heads?: number
   prompt_length?: number
 }
 
@@ -142,7 +178,52 @@ const diffusionModel = ref<string | null>(null)
 
 const tokens = reactive<{ text: string; cls: string }[]>([])
 const heartbeat = reactive<HeartbeatPoint[]>([])
+const netPoints = reactive<HeartbeatPoint[]>([])
+const stepTimes = reactive<number[]>([])
 let t0 = 0
+let _netCount = 0
+
+// ── network request tracker ──────────────────────────────────────────────
+function recordNetRequest() {
+  if (t0 === 0) return
+  const elapsed = (performance.now() - t0) / 1000
+  _netCount++
+  netPoints.push({ x: elapsed, y: _netCount })
+}
+
+// ── model badge ───────────────────────────────────────────────────────────
+const _tokensPerSecHistory = reactive<number[]>([])
+let _lastStepTime = 0
+const _currentRunModel = ref<string | null>(null)
+const _currentRunType = ref<'AR' | 'diffusion' | null>(null)
+
+const modelLabel = computed(() => {
+  const m = _currentRunModel.value
+  if (!m) return ''
+  const short = m.split('/').pop() ?? m
+  const type = _currentRunType.value ?? ''
+  const avg = _tokensPerSecHistory.length
+    ? (_tokensPerSecHistory.reduce((a, b) => a + b, 0) / _tokensPerSecHistory.length).toFixed(1)
+    : null
+  return avg ? `${short} · ${type} · ~${avg} tok/s` : `${short} · ${type}`
+})
+
+function resetRunMetrics(model: string, type: 'AR' | 'diffusion') {
+  _currentRunModel.value = model
+  _currentRunType.value = type
+  _tokensPerSecHistory.length = 0
+  _lastStepTime = 0
+}
+
+function recordStepTempo(newTokenCount: number) {
+  const now = performance.now() / 1000
+  if (_lastStepTime > 0 && newTokenCount > 0) {
+    const dt = now - _lastStepTime
+    if (dt > 0) _tokensPerSecHistory.push(newTokenCount / dt)
+  }
+  _lastStepTime = now
+  stepTimes.push((performance.now() - t0) / 1000)
+}
 
 const prevIds = reactive<{ ar: number[]; diffusion: number[] }>({ ar: [], diffusion: [] })
 
@@ -160,6 +241,143 @@ const ttsVolume = ref(1)
 // ── timescale mode ───────────────────────────────────────────────────────
 const timescale = ref<'inference' | 'attention'>('inference')
 const selectedTokenIdx = ref(0)
+
+// ── head selection (multi-select) ────────────────────────────────────────
+const headAvg = ref(true)
+const selectedHeads = reactive(new Set<number>())
+const nHeads = ref(32)
+const availableVoices = ref<string[]>(['af_heart'])
+const tokenBlurs = reactive<number[]>([])
+
+// Fixed voice palette: index 0 = avg voice, indices 1-4 = head voices (cycling)
+const DEFAULT_VOICES = ['af_heart', 'af_nicole', 'am_michael', 'bf_alice', 'bm_fable']
+
+// ── derived state ─────────────────────────────────────────────────────────
+const isDiffAttnMode = computed(() =>
+  timescale.value === 'attention' && (lastStep.value?.mask_positions?.length ?? 0) > 0
+)
+
+function isSelectedToken(i: number): boolean {
+  if (timescale.value !== 'attention') return false
+  if (isDiffAttnMode.value) return i === selectedTokenIdx.value
+  return i === tokens.length - 1
+}
+
+async function fetchVoices() {
+  try {
+    const r = await fetch('/api/voices', { headers: authHeaders() })
+    if (r.ok) availableVoices.value = await r.json()
+  } catch { /* use default */ }
+}
+
+// Head h → voice index 1..4 (cycling), title shown as tooltip
+function headVoice(h: number): string {
+  return DEFAULT_VOICES[1 + (h % 4)]
+}
+
+// Avg always uses the first voice
+function avgVoice(): string { return DEFAULT_VOICES[0] }
+
+function toggleAvg() {
+  headAvg.value = true
+  selectedHeads.clear()
+  _recomputeAfterHeadChange()
+}
+
+function toggleHead(h: number) {
+  if (headAvg.value) {
+    headAvg.value = false
+    selectedHeads.clear()
+    selectedHeads.add(h)
+  } else if (selectedHeads.has(h)) {
+    selectedHeads.delete(h)
+    if (selectedHeads.size === 0) headAvg.value = true
+  } else {
+    selectedHeads.add(h)
+  }
+  _recomputeAfterHeadChange()
+}
+
+function _recomputeAfterHeadChange() {
+  if (!lastStep.value || timescale.value !== 'attention') return
+  if (isDiffAttnMode.value) {
+    updateDiffusionBlurs(lastStep.value)
+    playDiffusionAttentionTTS(lastStep.value)
+  } else {
+    updateARBlurs(lastStep.value, arAttnTokens.length)
+  }
+}
+
+// ── effective attention row (averaged over selection, used for blur) ──────
+function getEffectiveAttnRow(ev: StepEvent, rowIdx?: number): number[] {
+  const isDiff = (ev.mask_positions?.length ?? 0) > 0
+  const useMean = headAvg.value || selectedHeads.size === 0
+
+  if (useMean || !ev.attention_heads) {
+    if (!isDiff) return (ev.attention as number[]) ?? []
+    return (ev.attention as number[][])?.[rowIdx ?? 0] ?? []
+  }
+
+  const heads = [...selectedHeads]
+  if (!isDiff) {
+    const rows = heads.map(h => (ev.attention_heads as number[][])[h] ?? [])
+    if (!rows.length) return (ev.attention as number[]) ?? []
+    const len = rows[0].length
+    return Array.from({ length: len }, (_, i) =>
+      rows.reduce((s, r) => s + (r[i] ?? 0), 0) / rows.length)
+  } else {
+    const rows = heads.map(h => (ev.attention_heads as number[][][])[h]?.[rowIdx ?? 0] ?? [])
+    if (!rows.length) return (ev.attention as number[][])?.[rowIdx ?? 0] ?? []
+    const len = rows[0].length
+    return Array.from({ length: len }, (_, i) =>
+      rows.reduce((s, r) => s + (r[i] ?? 0), 0) / rows.length)
+  }
+}
+
+// ── single head attention row (not averaged, used for per-voice TTS) ─────
+function getSingleHeadRow(ev: StepEvent, h: number, rowIdx?: number): number[] {
+  const isDiff = rowIdx !== undefined
+  if (!ev.attention_heads) return getEffectiveAttnRow(ev, rowIdx)
+  if (!isDiff) return (ev.attention_heads as number[][])[h] ?? (ev.attention as number[]) ?? []
+  return (ev.attention_heads as number[][][])[h]?.[rowIdx] ??
+         (ev.attention as number[][])?.[rowIdx] ?? []
+}
+
+// ── attention layers for TTS: one entry per active head (or avg) ──────────
+// rowIdx: undefined = AR (full last row), number = diffusion (gen-portion row idx)
+function buildAttnLayers(ev: StepEvent, rowIdx?: number): Array<{ voice: string; row: number[] }> {
+  if (headAvg.value || selectedHeads.size === 0) {
+    return [{ voice: avgVoice(), row: getEffectiveAttnRow(ev, rowIdx) }]
+  }
+  return [...selectedHeads].map(h => ({ voice: headVoice(h), row: getSingleHeadRow(ev, h, rowIdx) }))
+}
+
+const MAX_BLUR = 8
+
+function updateARBlurs(ev: StepEvent, genCount: number) {
+  const attnRow = getEffectiveAttnRow(ev)
+  const pl = Math.max(0, attnRow.length - genCount)
+  const scores = Array.from({ length: genCount }, (_, i) => attnRow[pl + i] ?? 0)
+  const maxS = Math.max(...scores, 1e-9)
+  tokenBlurs.length = 0
+  for (let i = 0; i < genCount; i++) {
+    tokenBlurs.push(i === genCount - 1 ? 0 : MAX_BLUR * (1 - scores[i] / maxS))
+  }
+}
+
+function updateDiffusionBlurs(ev: StepEvent) {
+  const maskSet = new Set(ev.mask_positions)
+  const total = ev.decoded_tokens.length
+  const selIdx = selectedTokenIdx.value
+  const attnRow = getEffectiveAttnRow(ev, selIdx)
+  const nonMaskMax = Math.max(...attnRow.filter((_, i) => !maskSet.has(i)), 1e-9)
+  tokenBlurs.length = 0
+  for (let i = 0; i < total; i++) {
+    if (i === selIdx) { tokenBlurs.push(0); continue }
+    if (maskSet.has(i)) { tokenBlurs.push(MAX_BLUR); continue }
+    tokenBlurs.push(MAX_BLUR * (1 - (attnRow[i] ?? 0) / nonMaskMax))
+  }
+}
 
 // AR attention mode state
 const arAttnTokens = reactive<string[]>([])   // accumulated generated token texts
@@ -235,6 +453,7 @@ onMounted(async () => {
   } catch { /* if backend is down, just proceed */ }
 
   checkServer()
+  fetchVoices()
   pollTimer = window.setInterval(checkServer, 5000)
   snapConstraints()
   // Warm up AudioContext on first user gesture so it's ready for TTS playback
@@ -328,15 +547,16 @@ function getAudioCtx(): AudioContext {
 }
 
 // Fetch TTS for a list of token texts; returns decoded AudioBuffers with their pan positions
-async function fetchTtsBuffers(tokenTexts: string[], pans: number[]): Promise<{ buffer: AudioBuffer; pan: number }[]> {
+async function fetchTtsBuffers(tokenTexts: string[], pans: number[], voice = 'af_heart'): Promise<{ buffer: AudioBuffer; pan: number }[]> {
   const ctx = getAudioCtx()
   const results = await Promise.all(tokenTexts.map(async (text, i) => {
     if (!text.trim() || SKIP_TOKENS.has(text.trim())) return null
     try {
+      recordNetRequest()
       const res = await fetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ text: text.trim() }),
+        body: JSON.stringify({ text: text.trim(), voice }),
       })
       if (!res.ok || res.status === 204) return null
       const ab = await res.arrayBuffer()
@@ -424,7 +644,7 @@ function switchTimescale(mode: 'inference' | 'attention') {
   timescale.value = mode
   // Reset state when switching
   tokens.length = 0
-  heartbeat.length = 0
+  heartbeat.length = 0; netPoints.length = 0; _netCount = 0; stepTimes.length = 0
   lastStep.value = null
   genStatus.value = ''
   resetDisplayQueue()
@@ -437,6 +657,9 @@ function switchTimescale(mode: 'inference' | 'attention') {
   diffGenerationDone.value = false
   diffCurrentAttn.value = null
   selectedTokenIdx.value = 0
+  tokenBlurs.length = 0
+  headAvg.value = true
+  selectedHeads.clear()
 }
 
 // ── pan helper ───────────────────────────────────────────────────────────
@@ -450,15 +673,19 @@ async function fetchTtsBuffersWithVolumes(
   tokenTexts: string[],
   pans: number[],
   volumes: number[],
+  voices?: string[],
 ): Promise<{ buffer: AudioBuffer; pan: number; volume: number }[]> {
   const ctx = getAudioCtx()
+  const defaultVoice = availableVoices.value[0] ?? 'af_heart'
   const results = await Promise.all(tokenTexts.map(async (text, i) => {
     if (!text.trim() || SKIP_TOKENS.has(text.trim())) return null
     try {
+      recordNetRequest()
+      const voice = voices?.[i] ?? defaultVoice
       const res = await fetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ text: text.trim() }),
+        body: JSON.stringify({ text: text.trim(), voice }),
       })
       if (!res.ok || res.status === 204) return null
       const ab = await res.arrayBuffer()
@@ -557,7 +784,8 @@ async function nextARStep() {
   arLastAttnRow.value = (ev.attention as number[]) ?? null
   lastStep.value = ev
 
-  // Render all accumulated tokens
+  // Render all accumulated tokens (last = selected, always sharp)
+  const total = arAttnTokens.length
   tokens.length = 0
   for (let i = 0; i < arAttnTokens.length; i++) {
     tokens.push({
@@ -565,34 +793,33 @@ async function nextARStep() {
       cls: i === arAttnTokens.length - 1 ? 'tok-new' : 'tok-old',
     })
   }
+  // Update blur based on current head selection
+  updateARBlurs(ev, total)
   scrollOutput()
 
-  // TTS: play new token first
-  const total = arAttnTokens.length
-  const newBufs = await fetchTtsBuffersWithVolumes([newText], [panForIndex(total - 1, total)], [1])
+  // TTS: play new token first with avg voice (always sharp / selected)
+  const newBufs = await fetchTtsBuffersWithVolumes(
+    [newText], [panForIndex(total - 1, total)], [1], [avgVoice()])
   let dur = 0
   if (newBufs.length) {
     dur = playAudioBuffersWithVolumes(newBufs)
     await new Promise(r => setTimeout(r, dur * 1000 + 80))
   }
 
-  // Then replay previous tokens with attention-mapped volume
-  if (arLastAttnRow.value && total > 1) {
-    const attnRow = arLastAttnRow.value
-    // Previous gen tokens are at the end of the attention row before the new token
-    // attnRow.length = prompt_len + 1 (the new token)
-    // Previously generated tokens occupy the last (total-1) positions before the new token
+  // Replay previous tokens — one TTS layer per active head (or avg), all fired simultaneously
+  if (total > 1) {
     const prevCount = total - 1
-    const offset = attnRow.length - 1 - prevCount  // start of prev gen tokens in attnRow
-    const rawVols = []
-    for (let i = 0; i < prevCount; i++) rawVols.push(attnRow[offset + i] ?? 0)
-    const maxV = Math.max(...rawVols, 1e-9)
-    const normVols = rawVols.map(v => v / maxV)
-
     const prevTexts = arAttnTokens.slice(0, prevCount)
     const prevPans = prevTexts.map((_, i) => panForIndex(i, total))
-    const bufs = await fetchTtsBuffersWithVolumes(prevTexts, prevPans, normVols)
-    playAudioBuffersWithVolumes(bufs)
+    const layers = buildAttnLayers(ev)   // each layer: {voice, row}
+    const allBufs = await Promise.all(layers.map(async ({ voice, row }) => {
+      const pl = Math.max(0, row.length - total)
+      const rawVols = Array.from({ length: prevCount }, (_, i) => row[pl + i] ?? 0)
+      const maxV = Math.max(...rawVols, 1e-9)
+      const normVols = rawVols.map(v => v / maxV)
+      return fetchTtsBuffersWithVolumes(prevTexts, prevPans, normVols, prevTexts.map(() => voice))
+    }))
+    for (const bufs of allBufs) playAudioBuffersWithVolumes(bufs)
   }
 
   genStatus.value = `✓ token ${total}`
@@ -640,8 +867,9 @@ async function nextDiffStep() {
   diffCurrentAttn.value = (ev.attention as number[][] | undefined) ?? null
   lastStep.value = ev
 
-  // Render diffusion tokens
+  // Render diffusion tokens + update blur
   renderDiffusion(ev)
+  updateDiffusionBlurs(ev)
   scrollOutput()
 
   // TTS: play selected token first, then all others with attention-mapped volume
@@ -652,45 +880,49 @@ async function nextDiffStep() {
 }
 
 async function playDiffusionAttentionTTS(ev: StepEvent) {
-  const attn = diffCurrentAttn.value
   const maskSet = new Set(ev.mask_positions)
   const sel = selectedTokenIdx.value
   const total = ev.decoded_tokens.length
 
-  // Play selected token at full volume
+  // Selected token: play at full volume with avg voice (always sharp)
   if (!maskSet.has(sel)) {
     const selText = ev.decoded_tokens[sel]
-    const selBufs = await fetchTtsBuffersWithVolumes([selText], [panForIndex(sel, total)], [1])
+    const selBufs = await fetchTtsBuffersWithVolumes(
+      [selText], [panForIndex(sel, total)], [1], [avgVoice()])
     if (selBufs.length) {
       const dur = playAudioBuffersWithVolumes(selBufs)
       await new Promise(r => setTimeout(r, dur * 1000 + 80))
     }
   }
 
-  // Play all other non-masked tokens with attention-mapped volume
-  const otherTexts: string[] = []
-  const otherPans: number[] = []
-  const otherVols: number[] = []
+  // Build the list of other visible tokens
+  const otherIdxs: number[] = [], otherTexts: string[] = [], otherPans: number[] = []
   for (let i = 0; i < total; i++) {
     if (i === sel || maskSet.has(i)) continue
+    otherIdxs.push(i)
     otherTexts.push(ev.decoded_tokens[i])
     otherPans.push(panForIndex(i, total))
-    const vol = attn ? (attn[sel]?.[i] ?? 0) : 0.5
-    otherVols.push(vol)
   }
-  const maxV = Math.max(...otherVols, 1e-9)
-  const normVols = otherVols.map(v => v / maxV)
+  if (!otherTexts.length) return
 
-  const bufs = await fetchTtsBuffersWithVolumes(otherTexts, otherPans, normVols)
-  playAudioBuffersWithVolumes(bufs)
+  // One TTS layer per active head (or single avg layer), all fired simultaneously
+  const layers = buildAttnLayers(ev, sel)
+  const allBufs = await Promise.all(layers.map(async ({ voice, row }) => {
+    const rawVols = otherIdxs.map(i => row[i] ?? 0)
+    const maxV = Math.max(...rawVols, 1e-9)
+    const normVols = rawVols.map(v => v / maxV)
+    return fetchTtsBuffersWithVolumes(otherTexts, otherPans, normVols, otherTexts.map(() => voice))
+  }))
+  for (const bufs of allBufs) playAudioBuffersWithVolumes(bufs)
 }
 
 // ── token click handler ──────────────────────────────────────────────────
 function onTokenClick(i: number) {
-  if (timescale.value !== 'attention') return
+  // Only interactive for diffusion attention mode
+  if (!isDiffAttnMode.value) return
   selectedTokenIdx.value = i
-  // Re-play TTS for diffusion if we have a current step
-  if (diffCurrentAttn.value && lastStep.value && lastStep.value.mask_positions) {
+  if (lastStep.value) {
+    updateDiffusionBlurs(lastStep.value)
     playDiffusionAttentionTTS(lastStep.value)
   }
 }
@@ -718,6 +950,8 @@ function pushHeartbeat(ev: StepEvent) {
   const elapsed = (performance.now() - t0) / 1000
   const unmasked = ev.decoded_tokens.length - ev.mask_positions.length
   heartbeat.push({ x: elapsed, y: unmasked })
+  recordStepTempo(ev.newly_revealed.length)
+  if (ev.n_heads) nHeads.value = ev.n_heads
   lastStep.value = ev
 }
 
@@ -734,10 +968,11 @@ async function runAR() {
   busy.value = true
   genStatus.value = `⟳ ${arModel.value}…`
   tokens.length = 0
-  heartbeat.length = 0
+  heartbeat.length = 0; netPoints.length = 0; _netCount = 0; stepTimes.length = 0
   lastStep.value = null
   t0 = performance.now()
   resetDisplayQueue()
+  resetRunMetrics(arModel.value, 'AR')
 
   const { ok, finalIds } = await streamGenerate(arModel.value, msg, prevIds.ar, (ev) => {
     enqueueStep(ev, renderAR)
@@ -753,11 +988,12 @@ async function runDiffuse() {
   const msg = userInput.value.trim(); if (!msg) return
   busy.value = true
   genStatus.value = `⟳ ${diffusionModel.value}…`
-  tokens.length = 0;
-  heartbeat.length = 0
+  tokens.length = 0
+  heartbeat.length = 0; netPoints.length = 0; _netCount = 0; stepTimes.length = 0
   lastStep.value = null
   t0 = performance.now()
   resetDisplayQueue()
+  resetRunMetrics(diffusionModel.value, 'diffusion')
 
   const { ok, finalIds } = await streamGenerate(diffusionModel.value, msg, prevIds.diffusion, (ev) => {
     enqueueStep(ev, renderDiffusion)
@@ -772,13 +1008,14 @@ async function runBoth() {
   const msg = userInput.value.trim(); if (!msg) return
   busy.value = true
   tokens.length = 0
-  heartbeat.length = 0
+  heartbeat.length = 0; netPoints.length = 0; _netCount = 0; stepTimes.length = 0
   lastStep.value = null
   t0 = performance.now()
   resetDisplayQueue()
 
   if (arModel.value) {
     genStatus.value = `⟳ ${arModel.value}…`
+    resetRunMetrics(arModel.value, 'AR')
     const { ok, finalIds } = await streamGenerate(arModel.value, msg, prevIds.ar, (ev) => {
       enqueueStep(ev, renderAR)
     })
@@ -787,11 +1024,12 @@ async function runBoth() {
   }
 
   // reset for diffusion pass
-  tokens.length = 0; heartbeat.length = 0; lastStep.value = null; t0 = performance.now()
+  tokens.length = 0; heartbeat.length = 0; netPoints.length = 0; _netCount = 0; stepTimes.length = 0; lastStep.value = null; t0 = performance.now()
   resetDisplayQueue()
 
   if (diffusionModel.value) {
     genStatus.value = `⟳ ${diffusionModel.value}…`
+    resetRunMetrics(diffusionModel.value, 'diffusion')
     const { ok, finalIds } = await streamGenerate(diffusionModel.value, msg, prevIds.diffusion, (ev) => {
       enqueueStep(ev, renderDiffusion)
     })
@@ -808,7 +1046,7 @@ async function stopOrClear() {
     try { await fetch('/api/stop', { method: 'POST', headers: authHeaders() }) } catch {}
   } else {
     tokens.length = 0
-    heartbeat.length = 0
+    heartbeat.length = 0; netPoints.length = 0; _netCount = 0; stepTimes.length = 0
     lastStep.value = null
     genStatus.value = ''
     prevIds.ar = []; prevIds.diffusion = []
@@ -845,6 +1083,15 @@ body {
   font-family: var(--font-sans);
   color: var(--color-text);
   margin: 1rem;
+}
+
+h1, h2, h3 {
+  color: var(--color-primary);
+}
+
+h2 {
+  font-size: 1.2rem;
+  display: block;
 }
 
 header {
@@ -934,6 +1181,8 @@ button:hover {
   margin: .2rem;
   color: var(--color-primary);
   background-color: var(--color-accent);
+  transition: filter 0.35s ease;
+  display: inline-block;
 }
 
 input::-webkit-outer-spin-button,
@@ -951,6 +1200,58 @@ input[type=number] {
   font-weight: bold;
   color: var(--color-primary);
   margin-right: 0.5rem;
+}
+
+/* ── head selector row ────────────────────────────────────────────────── */
+.head-row {
+  display: flex;
+  flex-wrap: wrap;
+  width: 100%;
+  margin-top: 0.5rem;
+  gap: 2px;
+}
+
+.head-btn {
+  flex: 1 1 auto;
+  min-width: 2rem;
+  font-size: 0.6rem;
+  padding: 3px 2px;
+  margin: 0;
+  text-transform: none;
+  border-bottom-width: 2px;
+  opacity: 0.55;
+  letter-spacing: 0;
+}
+
+.head-btn.head-active {
+  background-color: var(--color-accent);
+  opacity: 1;
+  font-weight: 700;
+}
+
+.btn-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.btn.stop {
+  margin-left: auto;
+  font-size: 1rem;
+  padding: 0.4rem 0.7rem;
+  color: var(--color-warning);
+  border-bottom-color: var(--color-warning);
+  opacity: 0.5;
+}
+
+.btn.stop:not(:disabled) {
+  opacity: 1;
+}
+
+.btn.stop:not(:disabled):hover {
+  background-color: var(--color-warning);
+  color: var(--color-secondary);
 }
 
 .toggle {
@@ -1016,5 +1317,15 @@ input[type=number] {
 
 pre {
   display: none;
+}
+
+footer {
+  border-top: 4px solid var(--color-primary);
+  text-align: center;
+}
+
+footer img {
+  margin-top: 2rem;
+  max-width: 100px;
 }
 </style>
