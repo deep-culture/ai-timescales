@@ -115,6 +115,7 @@ import HeartbeatGraph from './components/HeartbeatGraph.vue'
 // ── types ────────────────────────────────────────────────────────────────
 interface StepEvent {
   step_index: number
+  elapsed_s: number               // seconds since generation start (backend clock)
   token_ids: number[]
   decoded_tokens: string[]
   mask_positions: number[]
@@ -215,14 +216,13 @@ function resetRunMetrics(model: string, type: 'AR' | 'diffusion') {
   _lastStepTime = 0
 }
 
-function recordStepTempo(newTokenCount: number) {
-  const now = performance.now() / 1000
+function recordStepTempo(newTokenCount: number, elapsed_s: number) {
   if (_lastStepTime > 0 && newTokenCount > 0) {
-    const dt = now - _lastStepTime
+    const dt = elapsed_s - _lastStepTime
     if (dt > 0) _tokensPerSecHistory.push(newTokenCount / dt)
   }
-  _lastStepTime = now
-  stepTimes.push((performance.now() - t0) / 1000)
+  _lastStepTime = elapsed_s
+  stepTimes.push(elapsed_s)
 }
 
 const prevIds = reactive<{ ar: number[]; diffusion: number[] }>({ ar: [], diffusion: [] })
@@ -957,10 +957,10 @@ function renderDiffusion(ev: StepEvent) {
 }
 
 function pushHeartbeat(ev: StepEvent) {
-  const elapsed = (performance.now() - t0) / 1000
+  const elapsed = ev.elapsed_s
   const unmasked = ev.decoded_tokens.length - ev.mask_positions.length
   heartbeat.push({ x: elapsed, y: unmasked })
-  recordStepTempo(ev.newly_revealed.length)
+  recordStepTempo(ev.newly_revealed.length, elapsed)
   if (ev.n_heads) nHeads.value = ev.n_heads
   lastStep.value = ev
 }

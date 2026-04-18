@@ -17,6 +17,7 @@ class StepResult:
     attention: Optional[torch.Tensor] = None  # (n_heads, seq, seq) or None
     mask_positions: List[int] = field(default_factory=list)  # indices still masked
     newly_revealed: List[int] = field(default_factory=list)  # indices revealed this step
+    elapsed_s: float = 0.0                  # seconds since generation start (set by backend)
 
 
 class BaseGenerator(abc.ABC):

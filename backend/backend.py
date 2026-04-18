@@ -9,6 +9,7 @@ import base64 as _base64mod
 import io
 import json
 import threading
+import time
 import wave
 
 from dotenv import load_dotenv
@@ -324,6 +325,7 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
         q: asyncio.Queue = asyncio.Queue()
 
         def _run_gen() -> None:
+            gen_start = time.monotonic()
             try:
                 for sr in gen.generate_steps(
                     prompt,
@@ -337,6 +339,7 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                 ):
                     if _cancel.is_set():
                         break   # stop between steps; current CUDA op finishes cleanly
+                    sr.elapsed_s = time.monotonic() - gen_start
                     asyncio.run_coroutine_threadsafe(q.put(sr), loop)
             except Exception as exc:  # noqa: BLE001
                 asyncio.run_coroutine_threadsafe(q.put(exc), loop)
@@ -357,6 +360,7 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
             # item is a StepResult
             step_data: dict = {
                 "step_index":     item.step_index,
+                "elapsed_s":      item.elapsed_s,
                 "token_ids":      item.token_ids,
                 "decoded_tokens": item.decoded_tokens,
                 "mask_positions": item.mask_positions,
