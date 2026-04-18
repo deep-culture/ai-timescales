@@ -604,20 +604,19 @@ function resetDisplayQueue(): void {
   _draining = false
 }
 
-// Serial drain: processes steps in arrival order, waiting for each step's TTS.
-// New steps pushed during a drain are picked up by the running while-loop.
+// Serial drain: waits for each step's TTS, then renders + plays simultaneously.
 async function drainDisplayQueue(): Promise<void> {
   if (_draining) return
   _draining = true
   while (_displayQueue.length > 0) {
     const { ev, audioProm, renderFn } = _displayQueue.shift()!
-    const items = await audioProm
-    playAudioBuffers(items)
+    const items = await audioProm          // wait for TTS audio to be decoded
     pushHeartbeat(ev)
-    renderFn(ev)
+    renderFn(ev)                           // render tokens at the same moment audio starts
     scrollOutput()
-    await nextTick()                          // ← let Vue render before next step
-    await new Promise(r => setTimeout(r, 0)) // ← yield to the event loop
+    playAudioBuffers(items)
+    await nextTick()
+    await new Promise(r => setTimeout(r, 0))
   }
   _draining = false
 }

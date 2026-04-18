@@ -85,11 +85,12 @@ class LlamaGenerator(BaseGenerator):
         self,
         prompt_ids: torch.Tensor,
         gen_length: int = 64,
-        steps: int = 32,          # unused for AR – gen_length controls token count
-        block_length: int = 32,   # unused for AR
+        steps: int = 32,
+        block_length: int = 32,
         temperature: float = 0.0,
-        cfg_scale: float = 0.0,   # unused for AR
-        remasking: str = "low_confidence",  # unused for AR
+        cfg_scale: float = 0.0,
+        remasking: str = "low_confidence",
+        return_attention: bool = False,
     ) -> Iterator[StepResult]:
 
         self._prompt_len = prompt_ids.shape[1]
@@ -101,9 +102,7 @@ class LlamaGenerator(BaseGenerator):
         eos_id = self.tokenizer.eos_token_id
 
         for step in range(gen_length):
-            output = self.model(input_ids, output_attentions=True)
-            # output.logits may be on a different GPU with device_map;
-            # bring to self.device for consistent ops.
+            output = self.model(input_ids, output_attentions=return_attention)
             next_token_logits = output.logits[:, -1, :].to(self.device)
 
             if temperature == 0.0:
@@ -120,7 +119,7 @@ class LlamaGenerator(BaseGenerator):
 
             # Last-layer attention: (1, n_heads, seq, seq) → keep all heads → (n_heads, seq, seq)
             attn: torch.Tensor | None = None
-            if output.attentions:
+            if return_attention and output.attentions:
                 attn = output.attentions[-1][0].detach().cpu()  # (n_heads, T, T)
 
             decoded: List[str] = [self.decode_ids([tid]) for tid in generated]
@@ -130,8 +129,8 @@ class LlamaGenerator(BaseGenerator):
                 token_ids=list(generated),
                 decoded_tokens=decoded,
                 attention=attn,
-                mask_positions=[],                    # AR has no masking
-                newly_revealed=[len(generated) - 1],  # the token just appended
+                mask_positions=[],
+                newly_revealed=[len(generated) - 1],
             )
 
             if eos_id is not None and next_token_id == eos_id:

@@ -57,6 +57,7 @@ class BaseGenerator(abc.ABC):
         temperature: float = 0.0,
         cfg_scale: float = 0.0,
         remasking: str = "low_confidence",
+        return_attention: bool = False,
     ) -> Iterator[StepResult]:
         """
         Yield one ``StepResult`` per denoising / decoding step.

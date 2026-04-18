@@ -107,6 +107,7 @@ class LLaDAGenerator(BaseGenerator):
         temperature: float = 0.0,
         cfg_scale: float = 0.0,
         remasking: str = "low_confidence",
+        return_attention: bool = False,
     ) -> Iterator[StepResult]:
 
         prompt_len = prompt_ids.shape[1]
@@ -150,7 +151,7 @@ class LLaDAGenerator(BaseGenerator):
                 logits = logits.to(self.device)
 
                 attn = self.model.model.transformer.blocks[-1]._attn_weights
-                attn = attn.detach().cpu() if attn is not None else None
+                attn = attn.detach().cpu() if (return_attention and attn is not None) else None
 
                 logits_noisy = _add_gumbel_noise(logits, temperature)
                 x0 = torch.argmax(logits_noisy, dim=-1)

@@ -333,6 +333,7 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                     temperature=req.temperature,
                     cfg_scale=req.cfg_scale,
                     remasking=req.remasking,
+                    return_attention=req.return_attention,
                 ):
                     if _cancel.is_set():
                         break   # stop between steps; current CUDA op finishes cleanly
