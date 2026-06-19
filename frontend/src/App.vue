@@ -24,6 +24,7 @@
       <div>How can we listen to the rhythms in deep learning?</div>
       <div>How do different operations traverse timescales?</div>
       <div>What rhythms ‘get through’ to other temporal strata?</div>
+      <div>For LLaDA3-8B-Instruct, the pre-training took "0.13 million H800 GPU hours" <a href="https://arxiv.org/pdf/2502.09992">(Nie et al., 2025, p. 4)</a>.</div>
     </div>
     <div class="control-box params">
       <span><label>Gen length <input type="number" v-model.number="genLength" min="8" max="256" step="8" @change="snapConstraints()" /></label></span>
@@ -32,7 +33,7 @@
       <span><label>Block len <input type="number" v-model.number="blockLength" min="8" max="256" step="8" @change="snapConstraints()" /></label></span>
       <span class="note">{{ constraintNote }}</span>
     </div>
-    <!-- scales   -->
+    <!-- scales -->
     <div class="control-box scales">
       <span class="scales-header">Timescale</span>
       <button :class="['btn', 'toggle', timescale === 'inference' ? 'toggle-active' : '']" @click="switchTimescale('inference')">Inference</button>
@@ -55,9 +56,9 @@
         <button class="btn stop" :disabled="!busy" @click="stopOrClear" title="Stop inference">&#9632;</button>
       </div>
       <!-- head selector — only in attention timescale -->
-      <div v-if="timescale === 'attention'" class="head-row">
+      <div v-if="timescale === 'attention'" class="box-row head-row">
         <div><h2>Select final attention heads</h2></div>
-        <div>
+        <div class="attention-head-controls">
           <button
             :class="['head-btn', headAvg ? 'head-active' : '']"
             @click="toggleAvg()"
@@ -69,6 +70,27 @@
             :title="headVoice(h - 1)"
           >{{ h - 1 }}</button>
           </div>
+      </div>
+      <!-- layer echo playback — plays all attention layers first→last -->
+      <div v-if="timescale === 'attention'" class="box-row echo-row">
+        <div><h2>Attention echoes (per layer)</h2></div>
+        <div class="echo-controls">
+          <button
+            :class="['btn', 'toggle', playbackMode === 'eigenzeit' ? 'toggle-active' : '']"
+            @click="playbackMode = 'eigenzeit'"
+            title="Play layers at their real inter-layer delay (sub-millisecond)"
+          >Eigenzeit</button>
+          <button
+            :class="['btn', 'toggle', playbackMode === 'interval' ? 'toggle-active' : '']"
+            @click="playbackMode = 'interval'"
+            title="Insert a 2-second gap between layers so each is audible"
+          >2s interval</button>
+          <button
+            class="btn diff"
+            :disabled="!echoStep"
+            @click="toggleEchoes"
+          >{{ echoPlaying ? `■ Stop (layer ${echoLayer + 1})` : 'Play echoes' }}</button>
+        </div>
       </div>
     </div>
 
@@ -82,6 +104,26 @@
       :stepTimes="stepTimes"
       :modelLabel="modelLabel"
     />
+    <!-- attention timescale: per-layer "heartbeat" on the Eigenzeit axis,
+         with a dot marking the layer currently sonified -->
+    <template v-else-if="attnPoints.length">
+      <HeartbeatGraph
+        :points="attnPoints"
+        :stepTimes="attnLayerTimes"
+        :activeIndex="echoLayer"
+        :modelLabel="attnGraphLabel"
+        :baseline="0"
+      />
+      <div class="attn-graph-caption">
+        <strong>y = Direct Logit Attribution</strong> — how much each attention layer
+        pushes the final output toward the chosen token. The dashed line is zero:
+        above it the layer promotes the token, below it the layer suppresses it. It
+        projects each layer's attention write to the residual stream through the
+        model's final RMSNorm + unembedding onto the chosen token's logit, isolating
+        what each attention layer contributes to — i.e. “gets through to” — the output.<br>
+        → x = Eigenzeit (when each layer is reached) · dot = layer currently playing.
+      </div>
+    </template>
 
     <!-- single merged output box -->
     <div class="output" ref="outputEl">
@@ -113,6 +155,17 @@ import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import HeartbeatGraph from './components/HeartbeatGraph.vue'
 
 // ── types ────────────────────────────────────────────────────────────────
+// Per-layer "attention echoes" — present only on the final step of a sequence.
+interface LayerData {
+  n_layers: number
+  n_heads: number
+  timings_ns: number[]                          // one Eigenzeit timestamp per layer
+  diffusion: boolean
+  attention: number[][] | number[][][]          // per-layer mean: (L,T) AR or (L,gen,gen) DLM
+  attention_heads: number[][][] | number[][][][] // per-layer per-head: (L,H,T) or (L,H,gen,gen)
+  dla?: number[] | number[][]                   // direct logit attribution: (L,) AR or (L,gen) DLM
+}
+
 interface StepEvent {
   step_index: number
   elapsed_s: number               // seconds since generation start (backend clock)
@@ -124,6 +177,7 @@ interface StepEvent {
   attention_heads?: number[][] | number[][][] // per-head: (n_heads,T) or (n_heads,gen,gen)
   n_heads?: number
   prompt_length?: number
+  layers?: LayerData
 }
 
 interface HeartbeatPoint { x: number; y: number }
@@ -248,6 +302,17 @@ const selectedHeads = reactive(new Set<number>())
 const nHeads = ref(32)
 const availableVoices = ref<string[]>(['af_heart'])
 const tokenBlurs = reactive<number[]>([])
+
+// ── layer "echo" playback ─────────────────────────────────────────────────
+// Layer data from the final step of the last sequence (carries every layer's
+// attention + per-layer timings). One voice per layer, played first→last.
+const echoStep = ref<StepEvent | null>(null)
+// 'eigenzeit' → schedule each layer at its real (sub-ms) inter-layer delay;
+// 'interval'  → insert a 2-second gap between layers so it's audible.
+const playbackMode = ref<'eigenzeit' | 'interval'>('interval')
+const echoPlaying = ref(false)
+const echoLayer = ref(-1)              // layer currently sounding/blurring (-1 = idle)
+let _echoTimers: number[] = []         // pending blur-update timers, cleared on stop
 
 // Fixed voice palette: index 0 = avg voice, indices 1-4 = head voices (cycling)
 const DEFAULT_VOICES = ['af_heart', 'af_nicole', 'am_michael', 'bf_alice', 'bm_fable']
@@ -376,6 +441,37 @@ function updateDiffusionBlurs(ev: StepEvent) {
     if (i === selIdx) { tokenBlurs.push(0); continue }
     if (maskSet.has(i)) { tokenBlurs.push(MAX_BLUR); continue }
     tokenBlurs.push(MAX_BLUR * (1 - (attnRow[i] ?? 0) / nonMaskMax))
+  }
+}
+
+// Blur the tokens by ONE layer's attention (used while echoes play, so the
+// visual sweeps layer-by-layer in step with the audio). Mirrors the AR/DLM
+// blur maths above but reads the per-layer row instead of the merged step row.
+function applyLayerBlur(layers: LayerData, l: number) {
+  const ev = echoStep.value
+  if (!ev) return
+  if (!layers.diffusion) {
+    const genCount = arAttnTokens.length
+    const row = getLayerRow(layers, l)
+    const pl = Math.max(0, row.length - genCount)
+    const scores = Array.from({ length: genCount }, (_, i) => row[pl + i] ?? 0)
+    const maxS = Math.max(...scores, 1e-9)
+    tokenBlurs.length = 0
+    for (let i = 0; i < genCount; i++) {
+      tokenBlurs.push(i === genCount - 1 ? 0 : MAX_BLUR * (1 - scores[i] / maxS))
+    }
+  } else {
+    const maskSet = new Set(ev.mask_positions)
+    const total = ev.decoded_tokens.length
+    const sel = selectedTokenIdx.value
+    const row = getLayerRow(layers, l, sel)
+    const nonMaskMax = Math.max(...row.filter((_, i) => !maskSet.has(i)), 1e-9)
+    tokenBlurs.length = 0
+    for (let i = 0; i < total; i++) {
+      if (i === sel) { tokenBlurs.push(0); continue }
+      if (maskSet.has(i)) { tokenBlurs.push(MAX_BLUR); continue }
+      tokenBlurs.push(MAX_BLUR * (1 - (row[i] ?? 0) / nonMaskMax))
+    }
   }
 }
 
@@ -670,6 +766,8 @@ function switchTimescale(mode: 'inference' | 'attention') {
   tokenBlurs.length = 0
   headAvg.value = true
   selectedHeads.clear()
+  echoStep.value = null
+  stopEchoes()
 }
 
 // ── pan helper ───────────────────────────────────────────────────────────
@@ -727,6 +825,264 @@ function playAudioBuffersWithVolumes(items: { buffer: AudioBuffer; pan: number; 
     } catch { /* best-effort */ }
   }
   return maxDuration
+}
+
+// ── layer "echo" playback ──────────────────────────────────────────────────
+// Plays the per-layer attention scores layer-by-layer (first→last). Each layer
+// gets its own TTS voice; a token's amplitude scales with its attention score
+// (loud = attended, whisper = ignored). MASK tokens (diffusion) become white
+// noise. Tokens are panned left→right by their position in the sequence.
+
+let _noiseBuffer: AudioBuffer | null = null
+function getNoiseBuffer(ctx: AudioContext, dur = 0.35): AudioBuffer {
+  if (_noiseBuffer && _noiseBuffer.sampleRate === ctx.sampleRate) return _noiseBuffer
+  const len = Math.floor(ctx.sampleRate * dur)
+  const buf = ctx.createBuffer(1, len, ctx.sampleRate)
+  const d = buf.getChannelData(0)
+  for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * 0.4
+  _noiseBuffer = buf
+  return buf
+}
+
+// Sources scheduled by the echo playback, kept so a stop can cancel them.
+let _echoSources: AudioBufferSourceNode[] = []
+
+// Schedule already-decoded buffers at an absolute AudioContext time.
+function playAudioBuffersAt(items: { buffer: AudioBuffer; pan: number; volume: number }[], startTime: number): void {
+  if (!items.length) return
+  const ctx = getAudioCtx()
+  for (const { buffer, pan, volume } of items) {
+    try {
+      const src = ctx.createBufferSource()
+      src.buffer = buffer
+      const gainNode = ctx.createGain()
+      gainNode.gain.value = volume * ttsVolume.value
+      const panner = ctx.createStereoPanner()
+      panner.pan.value = pan
+      src.connect(panner); panner.connect(gainNode); gainNode.connect(ctx.destination)
+      src.start(startTime)
+      _echoSources.push(src)
+    } catch { /* best-effort */ }
+  }
+}
+
+// Schedule a burst of white-noise "tokens" (masks) at an absolute time.
+function playNoiseAt(noise: { pan: number; volume: number }[], startTime: number): void {
+  if (!noise.length) return
+  const ctx = getAudioCtx()
+  const buf = getNoiseBuffer(ctx)
+  for (const { pan, volume } of noise) {
+    try {
+      const src = ctx.createBufferSource()
+      src.buffer = buf
+      const gainNode = ctx.createGain()
+      gainNode.gain.value = volume * ttsVolume.value
+      const panner = ctx.createStereoPanner()
+      panner.pan.value = pan
+      src.connect(panner); panner.connect(gainNode); gainNode.connect(ctx.destination)
+      src.start(startTime)
+      _echoSources.push(src)
+    } catch { /* best-effort */ }
+  }
+}
+
+// Cancel any audio the echo playback has scheduled but not yet finished.
+function stopEchoSources(): void {
+  for (const src of _echoSources) {
+    try { src.stop() } catch { /* already stopped/ended */ }
+  }
+  _echoSources = []
+}
+
+// Token position → voice (cycles through the palette when tokens outnumber it).
+// Each token keeps the same voice across every layer, so a token's identity is
+// its voice while its sequence position is its pan.
+function tokenVoice(i: number): string {
+  const palette = availableVoices.value.length ? availableVoices.value : DEFAULT_VOICES
+  return palette[i % palette.length]
+}
+
+// Per-layer attention row, averaged over the active head selection.
+// rowIdx: undefined = AR (full last row); number = DLM (selected-token row).
+function getLayerRow(layers: LayerData, l: number, rowIdx?: number): number[] {
+  const useMean = headAvg.value || selectedHeads.size === 0
+  const isDiff = rowIdx !== undefined
+  if (useMean) {
+    const a = layers.attention as any
+    return (isDiff ? a[l]?.[rowIdx!] : a[l]) ?? []
+  }
+  const ah = layers.attention_heads as any
+  const heads = [...selectedHeads]
+  const rows: number[][] = heads.map(h => (isDiff ? ah[l]?.[h]?.[rowIdx!] : ah[l]?.[h]) ?? [])
+  if (!rows.length || !rows[0].length) {
+    const a = layers.attention as any
+    return (isDiff ? a[l]?.[rowIdx!] : a[l]) ?? []
+  }
+  const len = rows[0].length
+  return Array.from({ length: len }, (_, i) =>
+    rows.reduce((s, r) => s + (r[i] ?? 0), 0) / rows.length)
+}
+
+// Build one layer's playback: attention-weighted TTS tokens + noise (masks).
+// Each token carries its own voice (by sequence position, recycled).
+function buildLayerSchedule(ev: StepEvent, layers: LayerData, l: number):
+  { texts: string[]; pans: number[]; vols: number[]; voices: string[]; noise: { pan: number; volume: number }[] } {
+  const total = ev.decoded_tokens.length
+
+  if (!layers.diffusion) {
+    // AR: sonify every *previous* token (the last token is the query itself).
+    const gcount = arAttnTokens.length || total
+    const prevCount = Math.max(0, gcount - 1)
+    const row = getLayerRow(layers, l)
+    const pl = Math.max(0, row.length - gcount)
+    const texts = arAttnTokens.slice(0, prevCount)
+    const pans = texts.map((_, i) => panForIndex(i, gcount))
+    const voices = texts.map((_, i) => tokenVoice(i))
+    const raw = texts.map((_, i) => row[pl + i] ?? 0)
+    const maxV = Math.max(...raw, 1e-9)
+    return { texts, pans, vols: raw.map(v => v / maxV), voices, noise: [] }
+  }
+
+  // DLM: all tokens relative to the manually selected one; masks → white noise.
+  const sel = selectedTokenIdx.value
+  const maskSet = new Set(ev.mask_positions)
+  const row = getLayerRow(layers, l, sel)
+  const nonMaskMax = Math.max(...row.filter((_, i) => !maskSet.has(i)), 1e-9)
+  const texts: string[] = [], pans: number[] = [], vols: number[] = [], voices: string[] = []
+  const noise: { pan: number; volume: number }[] = []
+  for (let i = 0; i < total; i++) {
+    if (i === sel) continue
+    const pan = panForIndex(i, total)
+    const v = (row[i] ?? 0) / nonMaskMax
+    if (maskSet.has(i)) noise.push({ pan, volume: Math.min(1, v || 0.3) })
+    else { texts.push(ev.decoded_tokens[i]); pans.push(pan); vols.push(v); voices.push(tokenVoice(i)) }
+  }
+  return { texts, pans, vols, voices, noise }
+}
+
+// Per-layer start offsets (seconds, relative to the first layer).
+function computeLayerOffsets(layers: LayerData): number[] {
+  const L = layers.n_layers
+  if (playbackMode.value === 'interval') {
+    return Array.from({ length: L }, (_, l) => l * 2.0)   // 2-second audible gap
+  }
+  const t = layers.timings_ns
+  if (!t?.length) return Array.from({ length: L }, (_, l) => l * 0.001)
+  const t0 = t[0]
+  return t.map(x => Math.max(0, x - t0) / 1e9)             // real Eigenzeit (ns → s)
+}
+
+// Direct logit attribution of layer l toward the chosen token. AR = one value
+// per layer; DLM = one value per (layer, generated position) → pick the selected
+// token's column. Falls back to the layer index if no DLA was sent.
+function layerDla(layers: LayerData, l: number): number {
+  const dla = layers.dla
+  if (!dla) return l
+  if (layers.diffusion) return (dla as number[][])[l]?.[selectedTokenIdx.value] ?? 0
+  return (dla as number[])[l] ?? 0
+}
+
+// Attention "heartbeat": one point per layer. x = Eigenzeit (always — even when
+// the 2s interval is chosen for playback), y = that layer's Direct Logit
+// Attribution, i.e. how much the layer's attention pushes the final output
+// toward the chosen token (signed: positive = promotes it, negative = suppresses).
+const attnPoints = computed<{ x: number; y: number }[]>(() => {
+  const layers = echoStep.value?.layers
+  if (!layers) return []
+  const L = layers.n_layers
+  const t = layers.timings_ns
+  const t0 = (t && t.length) ? t[0] : 0
+  return Array.from({ length: L }, (_, l) => ({
+    x: (t && t.length) ? Math.max(0, t[l] - t0) / 1e9 : l,
+    y: layerDla(layers, l),
+  }))
+})
+
+// Per-layer Eigenzeit timestamps (seconds) → tick marks under the curve.
+const attnLayerTimes = computed<number[]>(() => {
+  const t = echoStep.value?.layers?.timings_ns
+  if (!t?.length) return []
+  const t0 = t[0]
+  return t.map(x => Math.max(0, x - t0) / 1e9)
+})
+
+const attnGraphLabel = computed(() => {
+  const layers = echoStep.value?.layers
+  if (!layers) return ''
+  return `attention · ${layers.n_layers} layers · ${layers.diffusion ? 'DLM' : 'AR'} · DLA`
+})
+
+let _echoWaitTimer: number | undefined
+let _echoWaitResolve: (() => void) | null = null
+
+function clearEchoTimers() {
+  for (const t of _echoTimers) clearTimeout(t)
+  _echoTimers = []
+}
+
+// Stop an in-flight echo playback: cancel pending blur sweeps + scheduled audio
+// and release the wait so playLayerEchoes can unwind.
+function stopEchoes() {
+  clearEchoTimers()
+  stopEchoSources()
+  if (_echoWaitTimer !== undefined) { clearTimeout(_echoWaitTimer); _echoWaitTimer = undefined }
+  echoLayer.value = -1
+  if (_echoWaitResolve) { const r = _echoWaitResolve; _echoWaitResolve = null; r() }
+}
+
+// Button handler: play if idle, stop if already playing.
+function toggleEchoes() {
+  if (echoPlaying.value) { stopEchoes(); genStatus.value = '■ echoes stopped' }
+  else playLayerEchoes()
+}
+
+async function playLayerEchoes() {
+  const ev = echoStep.value
+  if (!ev?.layers) { genStatus.value = '⚠ run a step in attention mode first'; return }
+  if (echoPlaying.value) return
+  echoPlaying.value = true
+  clearEchoTimers()
+  _echoSources = []
+  const layers = ev.layers
+  const L = layers.n_layers
+
+  // Show the final-state tokens so the per-layer blur maps onto what's on screen.
+  if (layers.diffusion) { renderDiffusion(ev); lastStep.value = ev }
+
+  genStatus.value = `⟳ playing ${L} attention layers (${playbackMode.value})…`
+  try {
+    // Pre-fetch every layer's TTS buffers in parallel so scheduling is precise.
+    const scheds = Array.from({ length: L }, (_, l) => buildLayerSchedule(ev, layers, l))
+    const bufsPerLayer = await Promise.all(scheds.map(s =>
+      fetchTtsBuffersWithVolumes(s.texts, s.pans, s.vols, s.voices)))
+
+    const ctx = getAudioCtx()
+    const offsets = computeLayerOffsets(layers)
+    const leadS = 0.15
+    const startAt = ctx.currentTime + leadS
+    for (let l = 0; l < L; l++) {
+      const at = startAt + offsets[l]
+      playAudioBuffersAt(bufsPerLayer[l], at)
+      playNoiseAt(scheds[l].noise, at)
+      // Sweep the blur to this layer in step with its audio (same lead/offset).
+      _echoTimers.push(window.setTimeout(() => {
+        echoLayer.value = l
+        applyLayerBlur(layers, l)
+        genStatus.value = `▶ layer ${l + 1}/${L}`
+      }, (leadS + offsets[l]) * 1000))
+    }
+    const totalDur = (offsets[L - 1] ?? 0) + leadS + 1.2
+    await new Promise<void>(resolve => {
+      _echoWaitResolve = resolve
+      _echoWaitTimer = window.setTimeout(resolve, totalDur * 1000)
+    })
+    if (echoLayer.value !== -1) genStatus.value = '✓ echoes done'
+  } finally {
+    echoLayer.value = -1
+    _echoWaitResolve = null
+    _echoWaitTimer = undefined
+    echoPlaying.value = false
+  }
 }
 
 // ── single-step fetch helper ─────────────────────────────────────────────
@@ -793,6 +1149,7 @@ async function nextARStep() {
   arAttnTokens.push(newText)
   arLastAttnRow.value = (ev.attention as number[]) ?? null
   lastStep.value = ev
+  if (ev.layers) echoStep.value = ev   // final step carries per-layer data
 
   // Render all accumulated tokens (last = selected, always sharp)
   const total = arAttnTokens.length
@@ -865,6 +1222,8 @@ async function nextDiffStep() {
 
     for (const s of allSteps) diffStepBuffer.push(s)
     diffGenerationDone.value = true
+    // The final step carries every layer's attention — use it for echo playback.
+    echoStep.value = [...allSteps].reverse().find(s => s.layers) ?? null
 
     if (!diffStepBuffer.length) { busy.value = false; genStatus.value = '⚠ no steps'; return }
   } else {
@@ -1051,6 +1410,7 @@ async function runBoth() {
 }
 
 async function stopOrClear() {
+  stopEchoes()  // also halt any running attention-echo playback
   if (busy.value) {
     abortCtrl?.abort()
     resetDisplayQueue()
@@ -1238,6 +1598,28 @@ input[type=number] {
   background-color: var(--color-accent);
   opacity: 1;
   font-weight: 700;
+}
+
+/* ── layer echo playback row ──────────────────────────────────────────── */
+.box-row {
+  width: 100%;
+  margin-top: 0.75rem;
+}
+
+.attention-head-controls, .echo-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.attn-graph-caption {
+  font-size: 0.7rem;
+  color: var(--color-primary);
+  opacity: 0.65;
+  text-align: center;
+  margin-top: 0.2rem;
+  line-height: 1.4;
 }
 
 .btn-row {

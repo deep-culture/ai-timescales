@@ -9,8 +9,14 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
-from LLaDA.patch_llada import patch_model
-from .base import BaseGenerator, StepResult
+from LLaDA.patch_llada import (
+    clear_layer_buffers,
+    collect_layer_attention,
+    collect_layer_outputs,
+    patch_model,
+    set_capture,
+)
+from .base import BaseGenerator, StepResult, rms_logit_attribution
 
 MASK_ID = 126336
 EOS_ID = 126081
@@ -116,6 +122,22 @@ class LLaDAGenerator(BaseGenerator):
     ) -> Iterator[StepResult]:
         self.free_memory()  # release previous run's tensors before allocating new ones
 
+        # Capture per-layer attention only when requested; keep inference fast.
+        set_capture(self.model, return_attention)
+
+        # Hook the final RMSNorm to grab the residual entering it (for DLA).
+        # Remove any stale hook first (a previous run may have been cancelled).
+        prev_hook = getattr(self, "_dla_hook", None)
+        if prev_hook is not None:
+            prev_hook.remove()
+        self._dla_hook = None
+        self._final_resid = None
+        ln_f = self.model.model.transformer.ln_f
+        def _ln_f_pre_hook(_m, inp):
+            self._final_resid = inp[0].detach()
+        if return_attention:
+            self._dla_hook = ln_f.register_forward_pre_hook(_ln_f_pre_hook)
+
         prompt_len = prompt_ids.shape[1]
         self._prompt_len = prompt_len
 
@@ -139,6 +161,7 @@ class LLaDAGenerator(BaseGenerator):
             num_transfer = _get_num_transfer_tokens(block_mask_index, steps_per_block)
 
             for i in range(steps_per_block):
+                is_final_step = (num_block == num_blocks - 1) and (i == steps_per_block - 1)
                 mask_index = x == MASK_ID
 
                 if cfg_scale > 0.0:
@@ -156,8 +179,39 @@ class LLaDAGenerator(BaseGenerator):
                 # the same device as x.
                 logits = logits.to(self.device)
 
-                attn = self.model.model.transformer.blocks[-1]._attn_weights
-                attn = attn.detach().cpu() if (return_attention and attn is not None) else None
+                # ── attention capture ────────────────────────────────────
+                # Every block now stores its weights (patch_model). Each step
+                # we keep the last layer for the live blur view and free the
+                # other blocks' GPU copies. Only on the *final* step do we
+                # gather all 32 layers + their per-layer timings for playback.
+                attn: torch.Tensor | None = None
+                attn_layers: torch.Tensor | None = None
+                layer_timings: list[int] = []
+                attention_dla: torch.Tensor | None = None
+                if return_attention:
+                    blocks = self.model.model.transformer.blocks
+                    if is_final_step:
+                        attn_layers, layer_timings = collect_layer_attention(self.model)
+                        if attn_layers is not None:
+                            attn = attn_layers[-1]  # (n_heads, T, T)
+                        # ── direct logit attribution per layer ───────────────
+                        outs = collect_layer_outputs(self.model)   # (L, T, C) on device
+                        if outs is not None and self._final_resid is not None:
+                            gen = slice(prompt_len, prompt_len + gen_length)
+                            target_ids = torch.argmax(logits[0, gen], dim=-1)  # (gen_len,)
+                            attention_dla = rms_logit_attribution(
+                                outs[:, gen, :],               # (L, gen_len, C)
+                                self._final_resid[0, gen],     # (gen_len, C)
+                                ln_f.weight,
+                                float(getattr(ln_f, "eps", 1e-5)),
+                                self.model.model.transformer.ff_out.weight,
+                                target_ids,
+                            ).cpu()                            # (L, gen_len)
+                    else:
+                        last_w = getattr(blocks[-1], "_attn_weights", None)
+                        if last_w is not None:
+                            attn = last_w[0].detach().to("cpu", torch.float32)
+                        clear_layer_buffers(self.model)  # release GPU copies each step
 
                 logits_noisy = _add_gumbel_noise(logits, temperature)
                 x0 = torch.argmax(logits_noisy, dim=-1)
@@ -203,9 +257,17 @@ class LLaDAGenerator(BaseGenerator):
                     attention=attn,
                     mask_positions=masks,
                     newly_revealed=revealed,
+                    attention_layers=attn_layers,
+                    layer_timings_ns=layer_timings,
+                    attention_dla=attention_dla,
                 )
                 global_step += 1
 
+        set_capture(self.model, False)  # back to the fast path once done
+        if self._dla_hook is not None:
+            self._dla_hook.remove()
+            self._dla_hook = None
+        self._final_resid = None
         self._final_x = x
 
     def get_final_text(self) -> str:

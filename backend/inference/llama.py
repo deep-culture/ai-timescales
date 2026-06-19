@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections import Counter
 from typing import Iterator, List
 
@@ -9,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .base import BaseGenerator, StepResult
+from .base import BaseGenerator, StepResult, rms_logit_attribution
 
 
 class LlamaGenerator(BaseGenerator):
@@ -34,6 +35,7 @@ class LlamaGenerator(BaseGenerator):
         self._final_ids: list[int] = []
         self._final_input_ids: torch.Tensor | None = None  # full seq for multi-turn
         self._prompt_len: int = 0
+        self._layer_entry_ns: dict[int, int] = {}  # per-layer Eigenzeit, reset each forward
 
     def load(self) -> None:
         n_gpus = torch.cuda.device_count()
@@ -86,6 +88,35 @@ class LlamaGenerator(BaseGenerator):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def _register_capture_hooks(self) -> list:
+        """
+        Attach hooks needed for the attention timescale, all read-only w.r.t. the
+        forward pass:
+          • per-layer pre-hook → Eigenzeit timestamp (when embeddings enter it)
+          • per-layer post-hook → the attention sub-layer's residual write at the
+            last position (for direct logit attribution)
+          • a pre-hook on the final RMSNorm → the residual entering it (for DLA)
+        Returns the hook handles to remove later.
+        """
+        handles = []
+        for idx, layer in enumerate(self.model.model.layers):
+            def _make_timing(i: int):
+                def _hook(_module, _inp):
+                    self._layer_entry_ns[i] = time.perf_counter_ns()
+                return _hook
+            def _make_output(i: int):
+                def _hook(_module, _inp, out):
+                    o = out[0] if isinstance(out, tuple) else out
+                    self._layer_attn_out[i] = o[:, -1, :].detach()[0]  # (C,)
+                return _hook
+            handles.append(layer.self_attn.register_forward_pre_hook(_make_timing(idx)))
+            handles.append(layer.self_attn.register_forward_hook(_make_output(idx)))
+
+        def _norm_pre(_module, inp):
+            self._final_resid = inp[0][:, -1, :].detach()[0]  # (C,)
+        handles.append(self.model.model.norm.register_forward_pre_hook(_norm_pre))
+        return handles
+
     @torch.no_grad()
     def generate_steps(
         self,
@@ -108,40 +139,83 @@ class LlamaGenerator(BaseGenerator):
         generated: list[int] = []
         eos_id = self.tokenizer.eos_token_id
 
-        for step in range(gen_length):
-            output = self.model(input_ids, output_attentions=return_attention)
-            next_token_logits = output.logits[:, -1, :].to(self.device)
+        capture_hooks = self._register_capture_hooks() if return_attention else []
+        try:
+            for step in range(gen_length):
+                self._layer_entry_ns = {}   # reset per-layer timestamps for this forward
+                self._layer_attn_out = {}   # reset per-layer attention residual writes
+                self._final_resid = None    # reset final residual
+                output = self.model(input_ids, output_attentions=return_attention)
+                next_token_logits = output.logits[:, -1, :].to(self.device)
 
-            if temperature == 0.0:
-                next_token_id = int(torch.argmax(next_token_logits, dim=-1).item())
-            else:
-                probs = F.softmax(next_token_logits / temperature, dim=-1)
-                next_token_id = int(torch.multinomial(probs, num_samples=1).item())
+                if temperature == 0.0:
+                    next_token_id = int(torch.argmax(next_token_logits, dim=-1).item())
+                else:
+                    probs = F.softmax(next_token_logits / temperature, dim=-1)
+                    next_token_id = int(torch.multinomial(probs, num_samples=1).item())
 
-            generated.append(next_token_id)
-            input_ids = torch.cat(
-                [input_ids, torch.tensor([[next_token_id]], dtype=torch.long, device=self.device)],
-                dim=1,
-            )
+                generated.append(next_token_id)
+                input_ids = torch.cat(
+                    [input_ids, torch.tensor([[next_token_id]], dtype=torch.long, device=self.device)],
+                    dim=1,
+                )
 
-            # Last-layer attention: (1, n_heads, seq, seq) → keep all heads → (n_heads, seq, seq)
-            attn: torch.Tensor | None = None
-            if return_attention and output.attentions:
-                attn = output.attentions[-1][0].detach().cpu()  # (n_heads, T, T)
+                is_eos = eos_id is not None and next_token_id == eos_id
+                is_last = (step == gen_length - 1) or is_eos
 
-            decoded: List[str] = [self.decode_ids([tid]) for tid in generated]
+                # Per-step we keep the last layer for the live blur view. On the
+                # final step we additionally stack every layer (n_layers, n_heads,
+                # T, T) plus its per-layer Eigenzeit timestamp for the playback.
+                attn: torch.Tensor | None = None
+                attn_layers: torch.Tensor | None = None
+                layer_timings: list[int] = []
+                attention_dla: torch.Tensor | None = None
+                if return_attention and output.attentions:
+                    attn = output.attentions[-1][0].detach().to("cpu", torch.float32)
+                    if is_last:
+                        n_layers = len(output.attentions)
+                        attn_layers = torch.stack(
+                            [a[0].detach().to("cpu", torch.float32) for a in output.attentions],
+                            dim=0,
+                        )
+                        layer_timings = [
+                            self._layer_entry_ns.get(i, 0) for i in range(n_layers)
+                        ]
+                        # ── direct logit attribution for the generated token ──
+                        if (self._final_resid is not None
+                                and len(self._layer_attn_out) == n_layers):
+                            outs = torch.stack(
+                                [self._layer_attn_out[i] for i in range(n_layers)], dim=0
+                            )  # (L, C)
+                            target = torch.tensor([next_token_id], device=self.device)
+                            attention_dla = rms_logit_attribution(
+                                outs.unsqueeze(1),                  # (L, 1, C)
+                                self._final_resid.unsqueeze(0),     # (1, C)
+                                self.model.model.norm.weight,
+                                float(self.model.model.norm.variance_epsilon),
+                                self.model.lm_head.weight,
+                                target,
+                            ).squeeze(1).cpu()                      # (L,)
 
-            yield StepResult(
-                step_index=step,
-                token_ids=list(generated),
-                decoded_tokens=decoded,
-                attention=attn,
-                mask_positions=[],
-                newly_revealed=[len(generated) - 1],
-            )
+                decoded: List[str] = [self.decode_ids([tid]) for tid in generated]
 
-            if eos_id is not None and next_token_id == eos_id:
-                break
+                yield StepResult(
+                    step_index=step,
+                    token_ids=list(generated),
+                    decoded_tokens=decoded,
+                    attention=attn,
+                    mask_positions=[],
+                    newly_revealed=[len(generated) - 1],
+                    attention_layers=attn_layers,
+                    layer_timings_ns=layer_timings,
+                    attention_dla=attention_dla,
+                )
+
+                if is_eos:
+                    break
+        finally:
+            for h in capture_hooks:
+                h.remove()
 
         self._final_ids = list(generated)
         self._final_input_ids = input_ids  # full prompt + generation, for multi-turn

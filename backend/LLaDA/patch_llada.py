@@ -1,8 +1,9 @@
 # patch_llada.py
+import time
 import torch
 import types
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 
 def _patched_scaled_dot_product_attention(
@@ -14,14 +15,16 @@ def _patched_scaled_dot_product_attention(
     dropout_p: float = 0.0,
     is_causal: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Manual SDPA that also returns attention weights."""
-    if self.flash_attn_func is not None and attn_mask is None:
-        # Flash attention path - can't extract weights
-        r = self.flash_attn_func(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-            dropout_p=dropout_p, causal=False
+    """SDPA that exposes attention weights only while capture is enabled.
+
+    When ``self._capture_attn`` is False we delegate to the block's original
+    implementation (saved as ``_orig_sdpa`` at patch time), so the inference
+    timescale keeps its original fused/flash speed and numerics untouched.
+    """
+    if not getattr(self, "_capture_attn", False):
+        return self._orig_sdpa(
+            q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
         )
-        return r.transpose(1, 2), None
 
     # Manual path - exposes attention weights
     assert k.size(1) == v.size(1)
@@ -51,6 +54,10 @@ def _patched_attention(
     layer_past=None,
     use_cache: bool = False,
 ):
+    # Eigenzeit: the instant the embeddings hit this attention layer. Recorded
+    # on the CPU (no cuda.synchronize) so we never block the forward pass.
+    self._attn_time_ns = time.perf_counter_ns()
+
     B, T, C = q.size()
     dtype = k.dtype
 
@@ -89,19 +96,96 @@ def _patched_attention(
     self._attn_weights = attn_weights
 
     att = att.transpose(1, 2).contiguous().view(B, T, C)
-    return self.attn_out(att), present
+    out = self.attn_out(att)
+    # Store the attention sub-layer's residual write (B, T, C) for direct logit
+    # attribution. This is exactly the vector added to the residual stream.
+    self._attn_output = out
+    return out, present
 
 
 def patch_model(model):
     """
-    Patch ONLY the last transformer block in a loaded LLaDA model to expose
-    attention weights via block._attn_weights after each forward pass.
-    All other blocks keep their original (fast) attention implementation.
+    Patch EVERY transformer block in a loaded LLaDA model so each block exposes
+    its attention weights via ``block._attn_weights`` and the time it ran via
+    ``block._attn_time_ns`` after each forward pass.
+
+    This is required for the second ("attention") timescale, which sonifies the
+    scores of every layer (32 layers × 32 heads). The manual attention path is
+    slower than fused/flash attention, but it is the only way to read the
+    weights back out — and we touch nothing else in the forward pass.
     """
-    last_block = model.model.transformer.blocks[-1]
-    last_block._scaled_dot_product_attention = types.MethodType(
-        _patched_scaled_dot_product_attention, last_block
-    )
-    last_block.attention = types.MethodType(_patched_attention, last_block)
-    print(f"Patched last block only (of {len(model.model.transformer.blocks)} total).")
+    blocks = model.model.transformer.blocks
+    for blk in blocks:
+        # Preserve the original SDPA so the non-capture path stays fast/faithful.
+        blk._orig_sdpa = blk._scaled_dot_product_attention
+        blk._scaled_dot_product_attention = types.MethodType(
+            _patched_scaled_dot_product_attention, blk
+        )
+        blk.attention = types.MethodType(_patched_attention, blk)
+        blk._attn_weights = None
+        blk._attn_output = None
+        blk._attn_time_ns = 0
+        blk._capture_attn = False
+    print(f"Patched all {len(blocks)} blocks for per-layer attention capture.")
     return model
+
+
+def set_capture(model, flag: bool) -> None:
+    """Enable/disable attention-weight capture on every block at once.
+
+    Capture is only turned on for the attention timescale; the inference
+    timescale leaves it off and pays no extra cost.
+    """
+    for blk in model.model.transformer.blocks:
+        blk._capture_attn = bool(flag)
+
+
+def collect_layer_attention(
+    model,
+) -> Tuple[Optional[torch.Tensor], List[int]]:
+    """
+    Gather every block's stored attention weights into one tensor and read back
+    the per-layer timestamps, then release the GPU copies.
+
+    Returns ``(attn, timings_ns)`` where ``attn`` is ``(n_layers, n_heads, T, T)``
+    on the CPU (float32, batch index 0) and ``timings_ns`` is one
+    ``perf_counter_ns`` value per layer. Returns ``(None, [])`` if any block has
+    no weights stored (e.g. a flash-attention path that can't expose them).
+    """
+    blocks = model.model.transformer.blocks
+    weights: List[torch.Tensor] = []
+    timings: List[int] = []
+    for blk in blocks:
+        w = getattr(blk, "_attn_weights", None)
+        if w is None:
+            return None, []
+        # w: (B, n_heads, T, T) — keep the first batch item (conditional pass).
+        weights.append(w[0].detach().to("cpu", torch.float32))
+        timings.append(int(getattr(blk, "_attn_time_ns", 0)))
+        blk._attn_weights = None  # free the GPU copy now that it's been read
+    return torch.stack(weights, dim=0), timings
+
+
+def collect_layer_outputs(model) -> Optional[torch.Tensor]:
+    """
+    Stack every block's attention residual write (``_attn_output``) into one
+    tensor ``(n_layers, T, C)`` on the model's device (batch index 0), for direct
+    logit attribution, then release the per-block copies. Returns ``None`` if any
+    block has nothing stored.
+    """
+    blocks = model.model.transformer.blocks
+    outs: List[torch.Tensor] = []
+    for blk in blocks:
+        o = getattr(blk, "_attn_output", None)
+        if o is None:
+            return None
+        outs.append(o[0].detach())  # (T, C), first batch item
+        blk._attn_output = None
+    return torch.stack(outs, dim=0)
+
+
+def clear_layer_buffers(model) -> None:
+    """Drop any stored per-block attention weights/outputs to free GPU memory."""
+    for blk in model.model.transformer.blocks:
+        blk._attn_weights = None
+        blk._attn_output = None

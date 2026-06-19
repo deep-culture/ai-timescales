@@ -8,16 +8,62 @@ from typing import Iterator, List, Optional
 import torch
 
 
+def rms_logit_attribution(
+    attn_outputs: torch.Tensor,   # (n_layers, P, C) per-layer attention residual writes
+    x_final: torch.Tensor,        # (P, C) full residual entering the final RMSNorm
+    gamma: torch.Tensor,          # (C,) final RMSNorm weight
+    eps: float,                   # RMSNorm epsilon
+    unembed_weight: torch.Tensor, # (V, C) unembedding / lm_head weight
+    target_ids: torch.Tensor,     # (P,) token id to attribute toward at each position
+) -> torch.Tensor:
+    """
+    Direct Logit Attribution for RMSNorm models.
+
+    Both LLaDA and Llama end in RMSNorm + unembedding, and a softmax over the
+    output is shift-invariant, so the contribution of a single residual-stream
+    component v to a token's logit is, with the final-LayerNorm scale frozen,
+
+        dla = (gamma ⊙ v / rms(x_final)) · W_U[token]
+
+    where rms(x_final) uses the *full* final residual at that position. We apply
+    this to each attention layer's residual write to measure how much that layer
+    pushes the output toward the chosen token. Returns ``(n_layers, P)`` (signed —
+    a layer can also push *against* the token).
+    """
+    dev = unembed_weight.device
+    a = attn_outputs.float().to(dev)                      # (L, P, C)
+    xf = x_final.float().to(dev)                          # (P, C)
+    g = gamma.float().to(dev)                             # (C,)
+    rms = torch.sqrt(xf.pow(2).mean(-1) + eps)            # (P,)
+    scale = g.unsqueeze(0) / rms.unsqueeze(1)             # (P, C)
+    normed = a * scale.unsqueeze(0)                       # (L, P, C)
+    W = unembed_weight.index_select(0, target_ids.to(dev)).float()  # (P, C)
+    return torch.einsum("lpc,pc->lp", normed, W)          # (L, P)
+
+
 @dataclass
 class StepResult:
     """Snapshot produced after a single denoising / decoding step."""
     step_index: int                         # 0-based
     token_ids: List[int]                    # generated token IDs (prompt excluded)
     decoded_tokens: List[str]               # per-token decoded strings
-    attention: Optional[torch.Tensor] = None  # (n_heads, seq, seq) or None
+    attention: Optional[torch.Tensor] = None  # last-layer (n_heads, seq, seq) or None
     mask_positions: List[int] = field(default_factory=list)  # indices still masked
     newly_revealed: List[int] = field(default_factory=list)  # indices revealed this step
     elapsed_s: float = 0.0                  # seconds since generation start (set by backend)
+
+    # ── second timescale: per-layer attention "echoes" ──────────────────────
+    # Populated only on the *final* step of a sequence (the layer playback runs
+    # once generation is done). ``attention_layers`` stacks every transformer
+    # layer's attention, ``layer_timings_ns`` records the wall-clock instant
+    # (perf_counter_ns) at which each layer's attention was computed during the
+    # forward pass — the "Eigenzeit" of the embeddings hitting each layer.
+    attention_layers: Optional[torch.Tensor] = None  # (n_layers, n_heads, seq, seq)
+    layer_timings_ns: List[int] = field(default_factory=list)  # one ns timestamp per layer
+    # Direct logit attribution of each attention layer to the chosen token(s):
+    #   AR  → shape (n_layers,)            (the single next-token prediction)
+    #   DLM → shape (n_layers, gen_len)    (one column per generated position)
+    attention_dla: Optional[torch.Tensor] = None
 
 
 class BaseGenerator(abc.ABC):

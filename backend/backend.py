@@ -407,6 +407,34 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                     # Diffusion: gen portion per head → (n_heads, gen_len, gen_len)
                     step_data["attention"] = mean_attn[pl:, pl:].float().tolist()
                     step_data["attention_heads"] = attn[:, pl:, pl:].float().tolist()
+
+            # ── second timescale: per-layer "attention echoes" (final step) ──
+            # One self-contained object carrying every layer's attention plus
+            # the per-layer timings, so the frontend can replay layer-by-layer.
+            if req.return_attention and item.attention_layers is not None:
+                is_diffusion = isinstance(gen, LLaDAGenerator)
+                al = item.attention_layers           # (n_layers, n_heads, T, T)
+                layers_obj: dict = {
+                    "n_layers":   int(al.shape[0]),
+                    "n_heads":    int(al.shape[1]),
+                    "timings_ns": [int(t) for t in item.layer_timings_ns],
+                    "diffusion":  is_diffusion,
+                }
+                if is_diffusion:
+                    # gen portion per layer: heads → (L,H,gen,gen), mean → (L,gen,gen)
+                    pl2 = gen._prompt_len
+                    per_head = al[:, :, pl2:, pl2:]
+                    layers_obj["attention_heads"] = per_head.tolist()
+                    layers_obj["attention"] = per_head.mean(1).tolist()
+                else:
+                    # AR: last row per layer → heads (L,H,T), mean (L,T)
+                    per_head = al[:, :, -1, :]
+                    layers_obj["attention_heads"] = per_head.tolist()
+                    layers_obj["attention"] = per_head.mean(1).tolist()
+                # Direct logit attribution per layer: (L,) for AR, (L,gen) for DLM.
+                if item.attention_dla is not None:
+                    layers_obj["dla"] = item.attention_dla.tolist()
+                step_data["layers"] = layers_obj
             yield _sse("step", step_data)
 
         # ── done or cancelled ──────────────────────────────────────────────
