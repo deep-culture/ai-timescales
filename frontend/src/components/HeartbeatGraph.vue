@@ -2,21 +2,22 @@
   <div class="heartbeat-wrap">
     <!-- model badge (top-left) -->
     <div v-if="modelLabel" class="model-badge">{{ modelLabel }}</div>
-
-    <!-- network toggle (top-right) -->
-    <button
-      class="net-toggle"
-      :class="{ active: showNetwork }"
-      @click="showNetwork = !showNetwork"
-      title="Show network request rhythm"
-    >net</button>
+    <!-- Y-axis labels -->
+    <div class="axis-labels">
+      <div class="top-left" v-if="!isAttentionTimescale">{{ yAxisMax }} tokens</div>
+      <div class="top-left" v-else>DLA</div>
+      <!-- X-axis labels -->
+      <div class="bottom-left">0ms</div>
+      <div class="bottom-right">{{ xAxisMaxMs }}ms</div>
+    </div>
 
     <svg
       class="heartbeat"
-      viewBox="0 0 1000 120"
+      viewBox="0 0 1000 140"
       preserveAspectRatio="none"
       xmlns="http://www.w3.org/2000/svg"
     >
+
       <!-- zero / baseline reference line -->
       <line
         v-if="baselineY !== null"
@@ -29,17 +30,6 @@
       />
       <!-- inference line -->
       <path v-if="path" :d="path" fill="none" stroke="#832161" stroke-width="4" vector-effect="non-scaling-stroke" />
-      <!-- network requests line -->
-      <path
-        v-if="showNetwork && netPath"
-        :d="netPath"
-        fill="none"
-        stroke="#832161"
-        stroke-width="2"
-        stroke-dasharray="6 4"
-        opacity="0.4"
-        vector-effect="non-scaling-stroke"
-      />
     </svg>
 
     <!-- step-interval tick marks -->
@@ -75,18 +65,16 @@ import { ref, computed } from 'vue'
 
 const props = defineProps<{
   points: { x: number; y: number }[]
-  netPoints?: { x: number; y: number }[]
   stepTimes?: number[]   // wall-clock timestamps (seconds) of each inference step
   modelLabel?: string    // e.g. "llama-3.2-1B · AR · 12 tok/s"
   activeIndex?: number   // index of the point currently highlighted (-1/undefined = none)
   baseline?: number | null  // draw a horizontal reference line at this y value (e.g. 0)
+  isAttentionTimescale?: false
 }>()
 
 const W = 1000
-const H = 120
+const H = 140
 const PAD = 3
-
-const showNetwork = ref(false)
 
 // Scale a point series to viewBox coords; also return each point's x so the
 // active-layer cursor can sit exactly on its data point, plus the mapped y of an
@@ -121,7 +109,6 @@ function scalePoints(
 const scaled = computed(() => scalePoints(props.points, props.baseline))
 const path = computed(() => scaled.value.d)
 const baselineY = computed(() => scaled.value.baselineY)
-const netPath = computed(() => scalePoints(props.netPoints ?? []).d)
 
 // Horizontal position (% of width) of the currently-sonified layer's dot.
 const cursorLeftPct = computed<number | null>(() => {
@@ -142,6 +129,15 @@ const tickPositions = computed(() => {
   const xRange = xMax - xMin || 1
   return times.map(t => ((t - xMin) / xRange) * W)
 })
+
+const xAxisMaxMs = computed(() => {
+  const times = props.stepTimes
+  if (!times?.length) return 0
+
+  return Math.round((times[times.length - 1] - times[0]) * 1000)
+})
+
+const yAxisMax = computed(() => props.points.length)
 </script>
 
 <style scoped>
@@ -151,7 +147,7 @@ const tickPositions = computed(() => {
 
 .heartbeat {
   width: 100%;
-  height: 120px;
+  height: 140px;
   background: transparent;
   display: block;
 }
@@ -179,45 +175,30 @@ const tickPositions = computed(() => {
 
 /* model badge — top-left */
 .model-badge {
-  position: absolute;
-  top: 7px;
-  left: 10px;
   z-index: 2;
   font-family: var(--font-sans, sans-serif);
-  font-size: 0.62rem;
-  letter-spacing: 0.04em;
-  color: #832161;
-  opacity: 0.55;
+  font-size: 1.2rem;
+  color: var(--color-primary);
   pointer-events: none;
   white-space: nowrap;
 }
 
-/* network toggle — top-right */
-.net-toggle {
+.axis-labels {
+  opacity: .5;
+  color: var(--color-primary);
   position: absolute;
-  top: 6px;
-  right: 8px;
-  z-index: 2;
-  font-family: var(--font-sans, sans-serif);
-  font-size: 0.62rem;
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
-  padding: 2px 7px;
-  background: transparent;
-  color: #832161;
-  border: 1.5px dashed #832161;
-  border-bottom: 1.5px dashed #832161;
-  border-radius: 3px;
-  opacity: 0.4;
-  cursor: pointer;
-  margin: 0;
-  font-weight: 400;
-  transition: opacity 0.15s, background 0.15s;
+  width: 100%;
+  height: 100%;
 }
 
-.net-toggle:hover,
-.net-toggle.active {
-  opacity: 1;
-  background: rgba(131, 33, 97, 0.07);
+.axis-labels .bottom-left {
+  position: absolute;
+  bottom: 8px;
+}
+
+.axis-labels .bottom-right {
+  position: absolute;
+  bottom: 8px;
+  right: 0;
 }
 </style>

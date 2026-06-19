@@ -10,7 +10,12 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .base import BaseGenerator, StepResult, rms_logit_attribution
+from .base import (
+    BaseGenerator,
+    StepResult,
+    gpu_event_offsets_ns,
+    rms_logit_attribution,
+)
 
 
 class LlamaGenerator(BaseGenerator):
@@ -35,7 +40,8 @@ class LlamaGenerator(BaseGenerator):
         self._final_ids: list[int] = []
         self._final_input_ids: torch.Tensor | None = None  # full seq for multi-turn
         self._prompt_len: int = 0
-        self._layer_entry_ns: dict[int, int] = {}  # per-layer Eigenzeit, reset each forward
+        self._layer_entry_ns: dict[int, int] = {}  # per-layer CPU-fallback Eigenzeit
+        self._layer_events: list = []  # per-layer CUDA timing events (GPU Eigenzeit)
 
     def load(self) -> None:
         n_gpus = torch.cuda.device_count()
@@ -99,10 +105,21 @@ class LlamaGenerator(BaseGenerator):
         Returns the hook handles to remove later.
         """
         handles = []
+        # One reusable CUDA timing event per layer, recorded into the stream the
+        # instant the GPU reaches that layer's attention (async — no CPU stall).
+        n_layers = len(self.model.model.layers)
+        self._layer_events = (
+            [torch.cuda.Event(enable_timing=True) for _ in range(n_layers)]
+            if torch.cuda.is_available()
+            else [None] * n_layers
+        )
         for idx, layer in enumerate(self.model.model.layers):
             def _make_timing(i: int):
                 def _hook(_module, _inp):
-                    self._layer_entry_ns[i] = time.perf_counter_ns()
+                    ev = self._layer_events[i]
+                    if ev is not None:
+                        ev.record()
+                    self._layer_entry_ns[i] = time.perf_counter_ns()  # CPU fallback
                 return _hook
             def _make_output(i: int):
                 def _hook(_module, _inp, out):
@@ -178,9 +195,10 @@ class LlamaGenerator(BaseGenerator):
                             [a[0].detach().to("cpu", torch.float32) for a in output.attentions],
                             dim=0,
                         )
-                        layer_timings = [
-                            self._layer_entry_ns.get(i, 0) for i in range(n_layers)
-                        ]
+                        layer_timings = gpu_event_offsets_ns(
+                            self._layer_events[:n_layers],
+                            [self._layer_entry_ns.get(i, 0) for i in range(n_layers)],
+                        )
                         # ── direct logit attribution for the generated token ──
                         if (self._final_resid is not None
                                 and len(self._layer_attn_out) == n_layers):

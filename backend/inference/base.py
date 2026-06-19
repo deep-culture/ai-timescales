@@ -8,6 +8,33 @@ from typing import Iterator, List, Optional
 import torch
 
 
+def gpu_event_offsets_ns(
+    events: List[Optional["torch.cuda.Event"]],
+    fallback_ns: List[int],
+) -> List[int]:
+    """Per-layer Eigenzeit as *when the GPU actually executed* each layer.
+
+    ``events`` holds one CUDA timing event per layer, each ``record()``-ed into
+    the stream at the instant its layer began. We synchronize once here (the only
+    blocking call — and it happens after the forward pass, never mid-pass) and
+    then read the GPU-measured gaps, returned as nanosecond offsets relative to
+    the first layer (so layer 0 is always 0).
+
+    Falls back to the CPU ``perf_counter_ns`` timestamps in ``fallback_ns`` when
+    CUDA events are unavailable (CPU/MPS runs) or were never recorded — the wire
+    format (ns offsets per layer) is identical either way.
+    """
+    if torch.cuda.is_available() and events and all(e is not None for e in events):
+        try:
+            torch.cuda.synchronize()
+            t0 = events[0]
+            # elapsed_time is GPU-measured milliseconds → nanoseconds.
+            return [int(round(t0.elapsed_time(e) * 1e6)) for e in events]
+        except (RuntimeError, ValueError):
+            pass  # event not recorded / cross-device — fall through to CPU times
+    return list(fallback_ns)
+
+
 def rms_logit_attribution(
     attn_outputs: torch.Tensor,   # (n_layers, P, C) per-layer attention residual writes
     x_final: torch.Tensor,        # (P, C) full residual entering the final RMSNorm
@@ -55,11 +82,12 @@ class StepResult:
     # ── second timescale: per-layer attention "echoes" ──────────────────────
     # Populated only on the *final* step of a sequence (the layer playback runs
     # once generation is done). ``attention_layers`` stacks every transformer
-    # layer's attention, ``layer_timings_ns`` records the wall-clock instant
-    # (perf_counter_ns) at which each layer's attention was computed during the
-    # forward pass — the "Eigenzeit" of the embeddings hitting each layer.
+    # layer's attention, ``layer_timings_ns`` records, via CUDA timing events,
+    # *when the GPU actually executed* each layer relative to the first (ns
+    # offsets, layer 0 = 0) — the "Eigenzeit" of the embeddings hitting each
+    # layer. Falls back to CPU perf_counter_ns offsets when CUDA is unavailable.
     attention_layers: Optional[torch.Tensor] = None  # (n_layers, n_heads, seq, seq)
-    layer_timings_ns: List[int] = field(default_factory=list)  # one ns timestamp per layer
+    layer_timings_ns: List[int] = field(default_factory=list)  # one ns offset per layer
     # Direct logit attribution of each attention layer to the chosen token(s):
     #   AR  → shape (n_layers,)            (the single next-token prediction)
     #   DLM → shape (n_layers, gen_len)    (one column per generated position)

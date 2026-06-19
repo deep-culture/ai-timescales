@@ -319,6 +319,15 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
         else:
             prompt = new_ids
 
+    # Full-sequence token labels for the attention timescale: the model ingests
+    # and attends over the prompt + chat-template/special tokens too, so expose
+    # them (decoded individually, specials kept) alongside a per-token "is special"
+    # mask. Cheap (prompt is short) and only needed when capturing attention.
+    _special_ids = set(getattr(gen.tokenizer, "all_special_ids", []) or [])
+    _prompt_id_list = prompt[0].tolist() if req.return_attention else []
+    _prompt_tokens = [gen.decode_ids([t]) for t in _prompt_id_list]
+    _prompt_specials = [bool(t in _special_ids) for t in _prompt_id_list]
+
     async def event_stream() -> AsyncGenerator[str, None]:
         loop = asyncio.get_running_loop()
         # Queue items: StepResult | Exception | None (None = sentinel / done)
@@ -404,9 +413,10 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                     step_data["attention"] = mean_attn[-1].float().tolist()
                     step_data["attention_heads"] = attn[:, -1, :].float().tolist()
                 else:
-                    # Diffusion: gen portion per head → (n_heads, gen_len, gen_len)
-                    step_data["attention"] = mean_attn[pl:, pl:].float().tolist()
-                    step_data["attention_heads"] = attn[:, pl:, pl:].float().tolist()
+                    # Diffusion: gen-token queries, but keys span the FULL sequence
+                    # (prompt + specials are attended to) → (n_heads, gen_len, T)
+                    step_data["attention"] = mean_attn[pl:, :].float().tolist()
+                    step_data["attention_heads"] = attn[:, pl:, :].float().tolist()
 
             # ── second timescale: per-layer "attention echoes" (final step) ──
             # One self-contained object carrying every layer's attention plus
@@ -421,9 +431,10 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                     "diffusion":  is_diffusion,
                 }
                 if is_diffusion:
-                    # gen portion per layer: heads → (L,H,gen,gen), mean → (L,gen,gen)
+                    # gen-token queries, full-sequence keys (prompt + specials
+                    # included): heads → (L,H,gen,T), mean → (L,gen,T)
                     pl2 = gen._prompt_len
-                    per_head = al[:, :, pl2:, pl2:]
+                    per_head = al[:, :, pl2:, :]
                     layers_obj["attention_heads"] = per_head.tolist()
                     layers_obj["attention"] = per_head.mean(1).tolist()
                 else:
@@ -435,6 +446,18 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                 if item.attention_dla is not None:
                     layers_obj["dla"] = item.attention_dla.tolist()
                 step_data["layers"] = layers_obj
+
+            # ── full-sequence token labels for the attention timescale ────────
+            # Prompt + special tokens (shown but not focusable) and a per-token
+            # "is special" mask for both prompt and generated tokens, so the
+            # frontend can render the whole attended sequence and mute specials
+            # in TTS. Display order = sequence order = attention key order.
+            if req.return_attention:
+                step_data["prompt_tokens"] = _prompt_tokens
+                step_data["prompt_specials"] = _prompt_specials
+                step_data["decoded_specials"] = [
+                    bool(t in _special_ids) for t in item.token_ids
+                ]
             yield _sse("step", step_data)
 
         # ── done or cancelled ──────────────────────────────────────────────

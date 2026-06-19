@@ -54,10 +54,6 @@ def _patched_attention(
     layer_past=None,
     use_cache: bool = False,
 ):
-    # Eigenzeit: the instant the embeddings hit this attention layer. Recorded
-    # on the CPU (no cuda.synchronize) so we never block the forward pass.
-    self._attn_time_ns = time.perf_counter_ns()
-
     B, T, C = q.size()
     dtype = k.dtype
 
@@ -103,17 +99,36 @@ def _patched_attention(
     return out, present
 
 
+def _record_attn_eigenzeit(module, _args):
+    """forward_pre_hook fired the instant the GPU reaches this block.
+
+    We sit on the block (not the attention method) so timing is decoupled from
+    the weight-capture path — the same hook would fire on the fused path too. We
+    ``record()`` a CUDA timing event into the stream (async — no CPU stall) and
+    also stamp a CPU ``perf_counter_ns`` as a fallback for non-CUDA runs. Gated on
+    ``_capture_attn`` so the inference timescale pays nothing.
+    """
+    if not getattr(module, "_capture_attn", False):
+        return
+    ev = getattr(module, "_attn_start_event", None)
+    if ev is not None:
+        ev.record()
+    module._attn_time_ns = time.perf_counter_ns()
+
+
 def patch_model(model):
     """
     Patch EVERY transformer block in a loaded LLaDA model so each block exposes
-    its attention weights via ``block._attn_weights`` and the time it ran via
-    ``block._attn_time_ns`` after each forward pass.
+    its attention weights via ``block._attn_weights`` and its Eigenzeit (when the
+    GPU executed it) via a per-block CUDA timing event recorded by a forward
+    pre-hook.
 
     This is required for the second ("attention") timescale, which sonifies the
     scores of every layer (32 layers × 32 heads). The manual attention path is
     slower than fused/flash attention, but it is the only way to read the
     weights back out — and we touch nothing else in the forward pass.
     """
+    use_events = torch.cuda.is_available()
     blocks = model.model.transformer.blocks
     for blk in blocks:
         # Preserve the original SDPA so the non-capture path stays fast/faithful.
@@ -125,6 +140,11 @@ def patch_model(model):
         blk._attn_weights = None
         blk._attn_output = None
         blk._attn_time_ns = 0
+        # GPU timing marker (reused/re-recorded each step). None on CPU/MPS.
+        blk._attn_start_event = (
+            torch.cuda.Event(enable_timing=True) if use_events else None
+        )
+        blk.register_forward_pre_hook(_record_attn_eigenzeit)
         blk._capture_attn = False
     print(f"Patched all {len(blocks)} blocks for per-layer attention capture.")
     return model
@@ -145,24 +165,31 @@ def collect_layer_attention(
 ) -> Tuple[Optional[torch.Tensor], List[int]]:
     """
     Gather every block's stored attention weights into one tensor and read back
-    the per-layer timestamps, then release the GPU copies.
+    the per-layer Eigenzeit from its CUDA timing event, then release the GPU
+    copies.
 
     Returns ``(attn, timings_ns)`` where ``attn`` is ``(n_layers, n_heads, T, T)``
-    on the CPU (float32, batch index 0) and ``timings_ns`` is one
-    ``perf_counter_ns`` value per layer. Returns ``(None, [])`` if any block has
-    no weights stored (e.g. a flash-attention path that can't expose them).
+    on the CPU (float32, batch index 0) and ``timings_ns`` is one ns offset per
+    layer (GPU execution time relative to layer 0; CPU fallback when no CUDA).
+    Returns ``(None, [])`` if any block has no weights stored (e.g. a
+    flash-attention path that can't expose them).
     """
+    from inference.base import gpu_event_offsets_ns  # local: avoid import cycle
+
     blocks = model.model.transformer.blocks
     weights: List[torch.Tensor] = []
-    timings: List[int] = []
+    events: List[Optional[torch.cuda.Event]] = []
+    fallback_ns: List[int] = []
     for blk in blocks:
         w = getattr(blk, "_attn_weights", None)
         if w is None:
             return None, []
         # w: (B, n_heads, T, T) — keep the first batch item (conditional pass).
         weights.append(w[0].detach().to("cpu", torch.float32))
-        timings.append(int(getattr(blk, "_attn_time_ns", 0)))
+        events.append(getattr(blk, "_attn_start_event", None))
+        fallback_ns.append(int(getattr(blk, "_attn_time_ns", 0)))
         blk._attn_weights = None  # free the GPU copy now that it's been read
+    timings = gpu_event_offsets_ns(events, fallback_ns)
     return torch.stack(weights, dim=0), timings
 
 
