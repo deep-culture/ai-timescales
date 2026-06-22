@@ -1,7 +1,7 @@
 <template>
   <div v-if="loginRequired && !loggedIn" class="login-overlay">
     <form class="login-box" @submit.prevent="doLogin">
-      <h2>AI Timescales</h2>
+      <h2>EigenzAIt</h2>
       <p v-if="loginError" class="login-error">{{ loginError }}</p>
       <label>Username<input v-model="loginUser" type="text" autocomplete="username" /></label>
       <label>Password<input v-model="loginPass" type="password" autocomplete="current-password" /></label>
@@ -11,16 +11,16 @@
 
   <template v-else>
   <header>
-    <span class="title"><strong>AI timescales</strong></span>
+    <span class="title"><strong>EigenzAIt</strong></span>
     <span :class="['dot', online ? 'on' : 'off']">●</span>
     <span class="status-text">{{ statusText }}</span>
   </header>
 
   <main>
     <div class="control-box intro-text">
-      <div>How can we listen to AI temporalities at different timescales?</div>
-      <div>What ‘gets through’ to adjacent temporal strata?</div>
-      <div>For LLaDA3-8B-Instruct, the pre-training took "0.13 million H800 GPU hours" <a href="https://arxiv.org/pdf/2502.09992">(Nie et al., 2025, p. 4)</a>.</div>
+      <div>How can we <a href="https://www.elgaronline.com/edcollchap/book/9781803928562/book-part-9781803928562-69.xml" target="_blank">critically listen</a> to AI temporalities at different timescales?</div>
+      <div>What ‘gets through’ to <a href="https://www.tandfonline.com/doi/abs/10.1207/S15327884MCA0704_03" target="_blank">adjacent temporal strata</a>?</div>
+      <div>What are the <a href="https://journals.sagepub.com/doi/10.1177/0263276413496286" target="_blank">distinct temporalities</a> of different AI architectures?</div>
     </div>
     <div class="control-box general-params">
       <div class="control-box-header">Generation settings</div>
@@ -1573,6 +1573,20 @@ body {
   font-family: var(--font-sans);
   color: var(--color-text);
   margin: 1rem;
+}
+
+a {
+  text-decoration: none;
+  color: var(--color-text);
+  border-bottom: 4px solid;
+}
+
+a:hover {
+  background-color: var(--color-accent);
+}
+
+.intro-text > div {
+  margin-bottom: .5rem;
 }
 
 h1, h2, h3 {
