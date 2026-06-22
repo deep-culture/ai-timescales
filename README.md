@@ -1,13 +1,12 @@
-# AI Timescales
+# EigenzAIt
 
-A dual-model comparison UI that streams token generation from an autoregressive (LLaMA) and a diffusion language model (LLaDA) side by side, with real-time TTS vocalization.
+A dual-model comparison UI that streams token generation from an autoregressive and a diffusion language model (LLaDA) side by side, with real-time TTS vocalization.
 
 ## Requirements
 
 - Python 3.10–3.12
 - Node.js 18+ and npm
-- A HuggingFace token with access to [LLaMA 3.2](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) — request access on the model page
-- One or two CUDA GPUs (CPU fallback works but is slow)
+- A HuggingFace token with access to [LLaMA 3.2](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) or another AR-LM — request access on the model page
 
 ---
 
@@ -36,7 +35,7 @@ nvm install node
 
 ### 3. Environment variables
 
-Create `backend/.env`:
+Create `.env`:
 
 ```env
 HF_TOKEN=hf_...          # HuggingFace token

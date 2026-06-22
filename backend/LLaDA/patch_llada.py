@@ -22,9 +22,11 @@ def _patched_scaled_dot_product_attention(
     timescale keeps its original fused/flash speed and numerics untouched.
     """
     if not getattr(self, "_capture_attn", False):
+        # The original returns a single tensor; wrap it so callers can always
+        # unpack the (attn_output, attn_weights) pair. No weights on this path.
         return self._orig_sdpa(
             q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
-        )
+        ), None
 
     # Manual path - exposes attention weights
     assert k.size(1) == v.size(1)
