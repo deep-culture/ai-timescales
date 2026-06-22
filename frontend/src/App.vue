@@ -20,7 +20,7 @@
     <div class="control-box intro-text">
       <div>How can we <a href="https://www.elgaronline.com/edcollchap/book/9781803928562/book-part-9781803928562-69.xml" target="_blank">critically listen</a> to AI temporalities at different timescales?</div>
       <div>What ‘gets through’ to <a href="https://www.tandfonline.com/doi/abs/10.1207/S15327884MCA0704_03" target="_blank">adjacent temporal strata</a>?</div>
-      <div>What are the <a href="https://journals.sagepub.com/doi/10.1177/0263276413496286" target="_blank">distinct temporalities</a> of different AI architectures?</div>
+      <div>What are the <a href="https://journals.sagepub.com/doi/10.1177/0263276413496286" target="_blank">distinct temporalities</a> of <a href="https://culturalanalytics.org/article/id/950/" target="_blank">different AI architectures</a>?</div>
     </div>
     <div class="control-box general-params">
       <div class="control-box-header">Generation settings</div>
@@ -52,7 +52,7 @@
       <button :class="['btn', 'toggle', timescale === 'attention' ? 'toggle-active' : '']" @click="switchTimescale('attention')">Attention</button>
     </div>
     <!-- input + buttons -->
-    <div class="control-box controls last-controls">
+    <div class="control-box prompt" :class="timescale === 'inference' ? 'last-controls' : ''">
       <div class="control-box-header">Prompt</div>
       <div>
         <input class="prompt-input" v-model="userInput" placeholder="Insert prompt" @keydown.enter="onEnter" />
@@ -60,58 +60,79 @@
       <div class="btn-row">
         <template v-if="timescale === 'inference'">
           <button class="btn ar" :disabled="busy || !online || !arModel" @click="runAR">Autoregress</button>
-          <button class="btn diff" :disabled="busy || !online || !diffusionModel" @click="runDiffuse">Diffuse</button>
-        </template>
-        <template v-else>
-          <button class="btn ar" :disabled="busy || !online || !arModel" @click="nextARStep">Next autoregression</button>
-          <button class="btn diff" :disabled="busy || !online || !diffusionModel" @click="nextDiffStep">Next denoise</button>
-        </template>
-
-        <div class="status-buttons">
-          <button class="btn status" v-if="genStatus[0] && genStatus[1]" :class="genStatus[0]" :title="genStatus[1]">
-            <span v-if="genStatus[0] == 'processing'" class="spinner"></span>
-            <span v-else-if="genStatus[0] == 'warning'">⚠️</span>
-            <span v-else-if="genStatus[0] == 'done'">✔</span>
-          </button>
-          <button class="btn stop" :disabled="!busy" @click="stopOrClear" title="Stop inference">&#9632;</button>
-        </div>
-
-      </div>
-      <!-- head selector — only in attention timescale -->
-      <div v-if="timescale === 'attention'" class="box-row head-row">
-        <div><h2>Select final attention heads</h2></div>
-        <div class="attention-head-controls">
-          <button
-            :class="['head-btn', headAvg ? 'head-active' : '']"
-            @click="toggleAvg()"
-          >avg</button>
-          <button
-            v-for="h in nHeads" :key="h - 1"
-            :class="['head-btn', (!headAvg && selectedHeads.has(h - 1)) ? 'head-active' : '']"
-            @click="toggleHead(h - 1)"
-            :title="headVoice(h - 1)"
-          >{{ h - 1 }}</button>
+          <button class="btn diff" :disabled="busy || !online || !diffusionModel" @click="runDiffuse">Denoise</button>
+          <div class="status-buttons">
+            <button class="btn status" v-if="genStatus[0] && genStatus[1]" :class="genStatus[0]" :title="genStatus[1]">
+              <span v-if="genStatus[0] == 'processing'" class="spinner"></span>
+              <span v-else-if="genStatus[0] == 'warning'">⚠️</span>
+              <span v-else-if="genStatus[0] == 'done'">✔</span>
+            </button>
+            <button class="btn stop" :disabled="!busy" @click="stopOrClear" title="Stop inference">&#9632;</button>
           </div>
+        </template>
+        <!-- attention: step the model one token/denoise at a time. Each button
+             both runs its step and, once started, relabels to "next …". The
+             status button on the right mirrors the inference status. -->
+        <template v-else>
+          <button
+            class="btn ar" :disabled="busy || !online || !arModel"
+            @click="nextARStep"
+          >{{ arAttnTokens.length ? 'Next autoregression' : 'Autoregress' }}</button>
+          <button
+            class="btn diff" :disabled="busy || !online || !diffusionModel"
+            @click="nextDiffStep"
+          >{{ diffStepBuffer.length ? 'Next denoising' : 'Denoise' }}</button>
+          <div class="status-buttons">
+            <button class="btn status" v-if="genStatus[0] && genStatus[1]" :class="genStatus[0]" :title="genStatus[1]">
+              <span v-if="genStatus[0] == 'processing'" class="spinner"></span>
+              <span v-else-if="genStatus[0] == 'warning'">⚠️</span>
+              <span v-else-if="genStatus[0] == 'done'">✔</span>
+            </button>
+            <button class="btn stop" :disabled="!busy" @click="stopOrClear" title="Stop step">&#9632;</button>
+          </div>
+        </template>
       </div>
-      <!-- layer echo playback — plays all attention layers first→last -->
-      <div v-if="timescale === 'attention'" class="box-row echo-row">
-        <div><h2>Attention echoes (per layer)</h2></div>
-        <div class="echo-controls">
+    </div>
+    <!-- head selector — only in attention timescale -->
+    <div v-if="timescale === 'attention'" class="control-box">
+      <div><h2>Attention heads</h2></div>
+      <div class="attention-head-controls">
+        <button
+          :class="['head-btn', headAvg ? 'head-active' : '']"
+          @click="toggleAvg()"
+        >avg</button>
+        <button
+          v-for="h in nHeads" :key="h - 1"
+          :class="['head-btn', (!headAvg && selectedHeads.has(h - 1)) ? 'head-active' : '']"
+          @click="toggleHead(h - 1)"
+        >{{ h - 1 }}</button>
+        </div>
+    </div>
+    <!-- layer echo playback — plays all attention layers first→last -->
+    <div v-if="timescale === 'attention'" class="control-box echo-row last-controls">
+      <div><h2>Attention echoes</h2></div>
+      <div class="btn-row">
+        <button
+          :class="['btn', 'toggle', playbackMode === 'eigenzeit' ? 'toggle-active' : '']"
+          @click="playbackMode = 'eigenzeit'"
+          title="Play layers at their real inter-layer delay (sub-millisecond)"
+        >Eigenzeit</button>
+        <button
+          :class="['btn', 'toggle', playbackMode === 'interval' ? 'toggle-active' : '']"
+          @click="playbackMode = 'interval'"
+          title="Insert a 1-second gap between layers so each is audible"
+        >Interval</button>
+        <div class="status-buttons">
           <button
-            :class="['btn', 'toggle', playbackMode === 'eigenzeit' ? 'toggle-active' : '']"
-            @click="playbackMode = 'eigenzeit'"
-            title="Play layers at their real inter-layer delay (sub-millisecond)"
-          >Eigenzeit</button>
-          <button
-            :class="['btn', 'toggle', playbackMode === 'interval' ? 'toggle-active' : '']"
-            @click="playbackMode = 'interval'"
-            title="Insert a 2-second gap between layers so each is audible"
-          >2s interval</button>
-          <button
-            class="btn diff"
-            :disabled="!echoStep"
-            @click="toggleEchoes"
-          >{{ echoPlaying ? `■ Stop (layer ${echoLayer + 1})` : 'Play echoes' }}</button>
+              class="btn status play"
+              :disabled="!echoStep || echoPlaying"
+              @click="playLayerEchoes"
+              title="Play attention echoes"
+            >
+              <span v-if="echoPlaying" class="spinner"></span>
+              <span v-else>▶︎</span>
+            </button>
+            <button class="btn stop" :disabled="!echoPlaying" @click="stopEchoesClicked" title="Stop attention echoes">&#9632;</button>
         </div>
       </div>
     </div>
@@ -123,7 +144,7 @@
         v-if="timescale !== 'attention'"
         :points="heartbeat"
         :stepTimes="stepTimes"
-        :modelLabel="modelLabel"
+        :graphTitle="graphTitle"
       />
       <!-- attention timescale: per-layer "heartbeat" on the Eigenzeit axis,
            with a dot marking the layer currently sonified -->
@@ -132,18 +153,16 @@
           :points="attnPoints"
           :stepTimes="attnLayerTimes"
           :activeIndex="echoLayer"
-          :modelLabel="attnGraphLabel"
+          :graphTitle="attnGraphLabel"
           :baseline="0"
+          :isAttentionTimescale="true"
         />
         <div class="attn-graph-caption">
-          <strong>y = Direct Logit Attribution</strong>: how much each attention layer
+          <strong>Y = <a href="https://transformer-circuits.pub/2021/framework/index.html" target="_blank">Direct Logit Attribution</a></strong> (how much each attention layer
           pushes the final output toward the chosen token. The dashed line is zero:
-          above it the layer promotes the token, below it the layer suppresses it. It
-          projects each layer's attention write to the residual stream through the
-          model's final RMSNorm + unembedding onto the chosen token's logit, isolating
-          what each attention layer contributes to — i.e. “gets through to” — the output.<br>
-          x = Moment when each layer is reached, measured by CUDA events.<br>
-          dot = layer currently playing.
+          above it the layer promotes the token, below it the layer suppresses it).<br>
+          <strong>X = Moment when each layer is reached</strong> (measured by CUDA events).<br>
+          <strong>Dot = Currently playing.</strong>
         </div>
       </template>
 
@@ -268,7 +287,7 @@ let _lastStepTime = 0
 const _currentRunModel = ref<string | null>(null)
 const _currentRunType = ref<'AR' | 'diffusion' | null>(null)
 
-const modelLabel = computed(() => {
+const graphTitle = computed(() => {
   const m = _currentRunModel.value
   if (!m) return ''
   const short = m.split('/').pop() ?? m
@@ -276,7 +295,7 @@ const modelLabel = computed(() => {
   const avg = _tokensPerSecHistory.length
     ? (_tokensPerSecHistory.reduce((a, b) => a + b, 0) / _tokensPerSecHistory.length).toFixed(1)
     : null
-  return avg ? `${short} · ${type} · ~${avg} tok/s` : `${short} · ${type}`
+  return avg ? `${short} · ~${avg} tokens per second` : `${short}`
 })
 
 function resetRunMetrics(model: string, type: 'AR' | 'diffusion') {
@@ -328,6 +347,9 @@ const echoStep = ref<StepEvent | null>(null)
 const playbackMode = ref<'eigenzeit' | 'interval'>('interval')
 const echoPlaying = ref(false)
 const echoLayer = ref(-1)              // layer currently sounding/blurring (-1 = idle)
+// Echo playback status (spinner/done/warning) — shown in the echo-row, kept
+// separate from genStatus so it never appears in the prompt status button.
+const echoStatus = ref<[string, string]>(['', ''])
 let _echoTimers: number[] = []         // pending blur-update timers, cleared on stop
 
 // Fixed voice palette: index 0 = avg voice, indices 1-4 = head voices (cycling)
@@ -352,13 +374,6 @@ async function fetchVoices() {
 }
 
 // Head h → voice index 1..4 (cycling), title shown as tooltip
-function headVoice(h: number): string {
-  return DEFAULT_VOICES[1 + (h % 4)]
-}
-
-// Avg always uses the first voice
-function avgVoice(): string { return DEFAULT_VOICES[0] }
-
 function toggleAvg() {
   headAvg.value = true
   selectedHeads.clear()
@@ -413,24 +428,6 @@ function getEffectiveAttnRow(ev: StepEvent, rowIdx?: number): number[] {
     return Array.from({ length: len }, (_, i) =>
       rows.reduce((s, r) => s + (r[i] ?? 0), 0) / rows.length)
   }
-}
-
-// ── single head attention row (not averaged, used for per-voice TTS) ─────
-function getSingleHeadRow(ev: StepEvent, h: number, rowIdx?: number): number[] {
-  const isDiff = rowIdx !== undefined
-  if (!ev.attention_heads) return getEffectiveAttnRow(ev, rowIdx)
-  if (!isDiff) return (ev.attention_heads as number[][])[h] ?? (ev.attention as number[]) ?? []
-  return (ev.attention_heads as number[][][])[h]?.[rowIdx] ??
-         (ev.attention as number[][])?.[rowIdx] ?? []
-}
-
-// ── attention layers for TTS: one entry per active head (or avg)
-// rowIdx: undefined = AR (full last row), number = diffusion (gen-portion row idx)
-function buildAttnLayers(ev: StepEvent, rowIdx?: number): Array<{ voice: string; row: number[] }> {
-  if (headAvg.value || selectedHeads.size === 0) {
-    return [{ voice: avgVoice(), row: getEffectiveAttnRow(ev, rowIdx) }]
-  }
-  return [...selectedHeads].map(h => ({ voice: headVoice(h), row: getSingleHeadRow(ev, h, rowIdx) }))
 }
 
 const MAX_BLUR = 8
@@ -714,7 +711,7 @@ async function streamGenerate(
 // Generation runs freely; TTS fetches fire in parallel; display waits per-step
 // until its audio is ready, then plays + renders simultaneously.
 
-const SKIP_TOKENS = new Set(['<|endoftext|>', '<|eot_id|>', '<eos>', '<s>', '</s>', '<pad>'])
+const SKIP_TOKENS = new Set(['<|endoftext|>', '<|eot_id|>', '<|end_header_id|>', '<eos>', '<s>', '</s>', '<pad>'])
 
 let _audioCtx: AudioContext | null = null
 function getAudioCtx(): AudioContext {
@@ -852,6 +849,7 @@ function switchTimescale(mode: 'inference' | 'attention') {
   selectedHeads.clear()
   echoStep.value = null
   stopEchoes()
+  echoStatus.value = ['', '']
 }
 
 // pan helper
@@ -1040,7 +1038,7 @@ function buildLayerSchedule(ev: StepEvent, layers: LayerData, l: number):
 function computeLayerOffsets(layers: LayerData): number[] {
   const L = layers.n_layers
   if (playbackMode.value === 'interval') {
-    return Array.from({ length: L }, (_, l) => l * 2.0)   // 2-second audible gap
+    return Array.from({ length: L }, (_, l) => l * 1.0)   // 1-second audible gap
   }
   const t = layers.timings_ns
   if (!t?.length) return Array.from({ length: L }, (_, l) => l * 0.001)
@@ -1090,7 +1088,10 @@ const attnLayerTimes = computed<number[]>(() => {
 const attnGraphLabel = computed(() => {
   const layers = echoStep.value?.layers
   if (!layers) return ''
-  return `attention · ${layers.n_layers} layers · ${layers.diffusion ? 'DLM' : 'AR'} · DLA`
+  let modelName = _currentRunModel.value
+  if (!modelName) return ''
+  modelName = modelName.split('/').pop() ?? modelName
+  return `${modelName} · ${layers.n_layers} layers`
 })
 
 let _echoWaitTimer: number | undefined
@@ -1111,15 +1112,15 @@ function stopEchoes() {
   if (_echoWaitResolve) { const r = _echoWaitResolve; _echoWaitResolve = null; r() }
 }
 
-// Button handler: play if idle, stop if already playing.
-function toggleEchoes() {
-  if (echoPlaying.value) { stopEchoes(); genStatus.value = ['warning', 'Echoes stopped'] }
-  else playLayerEchoes()
+// Stop button handler (prompt box): halt playback and report it in the echo-row.
+function stopEchoesClicked() {
+  stopEchoes()
+  echoStatus.value = ['warning', 'Echoes stopped']
 }
 
 async function playLayerEchoes() {
   const ev = echoStep.value
-  if (!ev?.layers) { genStatus.value = ['error', 'Run a step in attention mode first']; return }
+  if (!ev?.layers) { echoStatus.value = ['warning', 'Run a step in attention mode first']; return }
   if (echoPlaying.value) return
   echoPlaying.value = true
   clearEchoTimers()
@@ -1130,7 +1131,7 @@ async function playLayerEchoes() {
   // Show the final-state tokens so the per-layer blur maps onto what's on screen.
   if (layers.diffusion) { renderDiffusion(ev); clampDiffSelection(ev); lastStep.value = ev }
 
-  genStatus.value = ['processing', `Playing ${L} attention layers (${playbackMode.value})…`]
+  echoStatus.value = ['processing', `Playing ${L} attention layers (${playbackMode.value})…`]
   try {
     // Pre-fetch every layer's TTS buffers in parallel so scheduling is precise.
     const scheds = Array.from({ length: L }, (_, l) => buildLayerSchedule(ev, layers, l))
@@ -1149,7 +1150,7 @@ async function playLayerEchoes() {
       _echoTimers.push(window.setTimeout(() => {
         echoLayer.value = l
         applyLayerBlur(layers, l)
-        genStatus.value = ['processing', `layer ${l + 1}/${L}`]
+        echoStatus.value = ['processing', `layer ${l + 1}/${L}`]
       }, (leadS + offsets[l]) * 1000))
     }
     const totalDur = (offsets[L - 1] ?? 0) + leadS + 1.2
@@ -1157,7 +1158,7 @@ async function playLayerEchoes() {
       _echoWaitResolve = resolve
       _echoWaitTimer = window.setTimeout(resolve, totalDur * 1000)
     })
-    if (echoLayer.value !== -1) genStatus.value = ['done', 'Echoes done']
+    if (echoLayer.value !== -1) echoStatus.value = ['done', 'Echoes done']
   } finally {
     echoLayer.value = -1
     _echoWaitResolve = null
@@ -1260,9 +1261,10 @@ async function nextARStep() {
   updateARBlurs(ev)
   scrollOutput()
 
-  // TTS: play new token first with avg voice (always sharp / selected)
+  // TTS: play new token first at full volume (always sharp / selected),
+  // in its own per-position voice.
   const newBufs = await fetchTtsBuffersWithVolumes(
-    [newText], [panForIndex(T - 1, T)], [1], [avgVoice()])
+    [newText], [panForIndex(T - 1, T)], [1], [tokenVoice(T - 1)])
   let dur = 0
   if (newBufs.length) {
     dur = playAudioBuffersWithVolumes(newBufs)
@@ -1270,7 +1272,8 @@ async function nextARStep() {
   }
 
   // Replay the rest of the sequence — prompt words + previous response tokens
-  // (special/template tokens muted) — one TTS layer per active head (or avg).
+  // (special/template tokens muted). Each token keeps its own per-position voice;
+  // its volume is the attention weight (averaged over the active head selection).
   const q = T - 1
   const speakIdx: number[] = []
   for (let d = 0; d < T; d++) {
@@ -1281,14 +1284,13 @@ async function nextARStep() {
   if (speakIdx.length) {
     const texts = speakIdx.map(d => d < PL ? (ev.prompt_tokens?.[d] ?? '') : arAttnTokens[d - PL])
     const pans = speakIdx.map(d => panForIndex(d, T))
-    const layers = buildAttnLayers(ev)   // each layer: {voice, row}
-    const allBufs = await Promise.all(layers.map(async ({ voice, row }) => {
-      const raw = speakIdx.map(d => row[d] ?? 0)
-      const maxV = Math.max(...raw, 1e-9)
-      const normVols = raw.map(v => v / maxV)
-      return fetchTtsBuffersWithVolumes(texts, pans, normVols, texts.map(() => voice))
-    }))
-    for (const bufs of allBufs) playAudioBuffersWithVolumes(bufs)
+    const voices = speakIdx.map(d => tokenVoice(d))
+    const row = getEffectiveAttnRow(ev)
+    const raw = speakIdx.map(d => row[d] ?? 0)
+    const maxV = Math.max(...raw, 1e-9)
+    const normVols = raw.map(v => v / maxV)
+    const bufs = await fetchTtsBuffersWithVolumes(texts, pans, normVols, voices)
+    playAudioBuffersWithVolumes(bufs)
   }
 
   genStatus.value = ['done', `Token ${arAttnTokens.length}`]
@@ -1357,11 +1359,11 @@ async function playDiffusionAttentionTTS(ev: StepEvent) {
   const sel = selectedTokenIdx.value               // display index of the query
   const maskSet = new Set(ev.mask_positions.map(m => PL + m))
 
-  // Selected token: play at full volume with avg voice (always sharp)
+  // Selected token: play at full volume in its own per-position voice (always sharp)
   if (!maskSet.has(sel)) {
     const selText = sel < PL ? (ev.prompt_tokens?.[sel] ?? '') : ev.decoded_tokens[sel - PL]
     const selBufs = await fetchTtsBuffersWithVolumes(
-      [selText], [panForIndex(sel, T)], [1], [avgVoice()])
+      [selText], [panForIndex(sel, T)], [1], [tokenVoice(sel)])
     if (selBufs.length) {
       const dur = playAudioBuffersWithVolumes(selBufs)
       await new Promise(r => setTimeout(r, dur * 1000 + 80))
@@ -1381,15 +1383,15 @@ async function playDiffusionAttentionTTS(ev: StepEvent) {
   }
   if (!otherTexts.length) return
 
-  // One TTS layer per active head (or single avg layer), all fired simultaneously
-  const layers = buildAttnLayers(ev, sel - PL)   // row is gen-indexed → strip prompt
-  const allBufs = await Promise.all(layers.map(async ({ voice, row }) => {
-    const rawVols = otherIdxs.map(d => row[d] ?? 0)
-    const maxV = Math.max(...rawVols, 1e-9)
-    const normVols = rawVols.map(v => v / maxV)
-    return fetchTtsBuffersWithVolumes(otherTexts, otherPans, normVols, otherTexts.map(() => voice))
-  }))
-  for (const bufs of allBufs) playAudioBuffersWithVolumes(bufs)
+  // Each token keeps its own per-position voice; its volume is the attention
+  // weight toward the selected query (averaged over the active head selection).
+  const row = getEffectiveAttnRow(ev, sel - PL)   // row is gen-indexed → strip prompt
+  const voices = otherIdxs.map(d => tokenVoice(d))
+  const rawVols = otherIdxs.map(d => row[d] ?? 0)
+  const maxV = Math.max(...rawVols, 1e-9)
+  const normVols = rawVols.map(v => v / maxV)
+  const bufs = await fetchTtsBuffersWithVolumes(otherTexts, otherPans, normVols, voices)
+  playAudioBuffersWithVolumes(bufs)
 }
 
 // ── token click handler
@@ -1576,18 +1578,14 @@ body {
   margin: 1rem;
 }
 
-a {
+a:not(:has(img)) {
+  color: var(--color-primary);
   text-decoration: none;
-  color: var(--color-text);
   border-bottom: 4px solid;
 }
 
 a:hover {
   background-color: var(--color-accent);
-}
-
-.intro-text > div {
-  margin-bottom: .5rem;
 }
 
 h1, h2, h3 {
@@ -1640,8 +1638,12 @@ header .dot.off {
 
 .intro-text {
   font-size: 1.2rem;
-  color: var(--color-primary);
 }
+
+.intro-text > div {
+  margin-bottom: .5rem;
+}
+
 
 .params span {
   color: var(--color-primary);
@@ -1729,14 +1731,6 @@ input[type=number] {
 }
 
 /* head selector row */
-.head-row {
-  display: flex;
-  flex-wrap: wrap;
-  width: 100%;
-  margin-top: 0.5rem;
-  gap: 2px;
-}
-
 .head-btn {
   flex: 1 1 auto;
   min-width: 2rem;
@@ -1766,6 +1760,11 @@ input[type=number] {
   align-items: center;
   justify-content: center;
   flex-wrap: wrap;
+  margin-top: .5rem;
+}
+
+.echo-controls {
+  justify-content: right;
 }
 
 .attn-graph-caption {
@@ -1773,8 +1772,12 @@ input[type=number] {
   color: var(--color-primary);
   opacity: 0.65;
   text-align: left;
-  margin-top: 0.4rem;
+  margin-top: 1rem;
   line-height: 1.4;
+}
+
+.attn-graph-caption a {
+  border-bottom: 2px solid;
 }
 
 .btn-row {
@@ -1791,6 +1794,26 @@ input[type=number] {
 .status-buttons > .btn {
   padding: 0.4rem 0.7rem;
   font-size: 1rem;
+}
+
+/* Step/echo control rows: every button (toggles, play, stop) shares one
+   compact size so the two rows look identical. */
+.echo-controls .btn {
+  font-size: 1rem;
+  padding: 0.3rem 0.8rem;
+}
+
+.btn.ar,
+.btn.diff,
+.btn.status.play {
+
+}
+
+/* The play button reuses .btn.status (spinner styling) but, unlike a plain
+   status readout, it is clickable. */
+.btn.status.play:not(:disabled):hover {
+  background-color: var(--color-accent);
+  cursor: pointer;
 }
 
 .btn.status .spinner {
@@ -1837,7 +1860,6 @@ input[type=number] {
 }
 
 .toggle {
-  font-size: 1rem;
   padding: 0.3rem 0.8rem;
 }
 
@@ -1923,7 +1945,7 @@ footer {
 }
 
 footer img {
-  margin-top: 2rem;
-  max-width: 100px;
+  margin-top: 5rem;
+  max-width: 250px;
 }
 </style>

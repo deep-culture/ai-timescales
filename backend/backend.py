@@ -328,6 +328,20 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
     _prompt_tokens = [gen.decode_ids([t]) for t in _prompt_id_list]
     _prompt_specials = [bool(t in _special_ids) for t in _prompt_id_list]
 
+    # Drop the leading BOS "attention sink" from the *exposed* sequence. Llama's
+    # <|begin_of_text|> (sometimes doubled) soaks up most attention in every head
+    # and layer, so it never blurs and dominates the blur/TTS normalisation. We
+    # trim it from the prompt labels and slice the same number of leading key
+    # columns off every attention row below (the model still ingests it — this
+    # only affects what the frontend renders/sonifies). LLaDA uses a different
+    # start token (<|startoftext|>), so it is left untouched.
+    _SINK_TOKEN = "<|begin_of_text|>"
+    _n_sink = 0
+    while _n_sink < len(_prompt_tokens) and _prompt_tokens[_n_sink] == _SINK_TOKEN:
+        _n_sink += 1
+    _prompt_tokens = _prompt_tokens[_n_sink:]
+    _prompt_specials = _prompt_specials[_n_sink:]
+
     async def event_stream() -> AsyncGenerator[str, None]:
         loop = asyncio.get_running_loop()
         # Queue items: StepResult | Exception | None (None = sentinel / done)
@@ -406,17 +420,18 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                 n_heads = attn.shape[0]
                 mean_attn = attn.mean(0)    # (T, T)
                 pl = gen._prompt_len
-                step_data["prompt_length"] = pl
+                ks = _n_sink                # leading sink (BOS) key columns to drop
+                step_data["prompt_length"] = pl - ks
                 step_data["n_heads"] = n_heads
                 if not item.mask_positions:
                     # AR: last row per head → (n_heads, T); also send mean for compat
-                    step_data["attention"] = mean_attn[-1].float().tolist()
-                    step_data["attention_heads"] = attn[:, -1, :].float().tolist()
+                    step_data["attention"] = mean_attn[-1, ks:].float().tolist()
+                    step_data["attention_heads"] = attn[:, -1, ks:].float().tolist()
                 else:
                     # Diffusion: gen-token queries, but keys span the FULL sequence
                     # (prompt + specials are attended to) → (n_heads, gen_len, T)
-                    step_data["attention"] = mean_attn[pl:, :].float().tolist()
-                    step_data["attention_heads"] = attn[:, pl:, :].float().tolist()
+                    step_data["attention"] = mean_attn[pl:, ks:].float().tolist()
+                    step_data["attention_heads"] = attn[:, pl:, ks:].float().tolist()
 
             # ── second timescale: per-layer "attention echoes" (final step) ──
             # One self-contained object carrying every layer's attention plus
@@ -430,16 +445,17 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                     "timings_ns": [int(t) for t in item.layer_timings_ns],
                     "diffusion":  is_diffusion,
                 }
+                ks = _n_sink                # leading sink (BOS) key columns to drop
                 if is_diffusion:
                     # gen-token queries, full-sequence keys (prompt + specials
                     # included): heads → (L,H,gen,T), mean → (L,gen,T)
                     pl2 = gen._prompt_len
-                    per_head = al[:, :, pl2:, :]
+                    per_head = al[:, :, pl2:, ks:]
                     layers_obj["attention_heads"] = per_head.tolist()
                     layers_obj["attention"] = per_head.mean(1).tolist()
                 else:
                     # AR: last row per layer → heads (L,H,T), mean (L,T)
-                    per_head = al[:, :, -1, :]
+                    per_head = al[:, :, -1, ks:]
                     layers_obj["attention_heads"] = per_head.tolist()
                     layers_obj["attention"] = per_head.mean(1).tolist()
                 # Direct logit attribution per layer: (L,) for AR, (L,gen) for DLM.

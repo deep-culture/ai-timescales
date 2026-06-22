@@ -1,11 +1,11 @@
 <template>
   <div class="heartbeat-wrap">
     <!-- model badge (top-left) -->
-    <div v-if="modelLabel" class="model-badge">{{ modelLabel }}</div>
+    <div v-if="graphTitle" class="model-badge">{{ graphTitle }}</div>
     <!-- Y-axis labels -->
     <div class="axis-labels">
       <div class="top-left" v-if="!isAttentionTimescale">{{ yAxisMax }} tokens</div>
-      <div class="top-left" v-else>DLA</div>
+      <div class="top-left" v-else>{{ topDla.toFixed(2) }} DLA</div>
       <!-- X-axis labels -->
       <div class="bottom-left">0ms</div>
       <div class="bottom-right">{{ xAxisMaxMs }}ms</div>
@@ -66,10 +66,10 @@ import { ref, computed } from 'vue'
 const props = defineProps<{
   points: { x: number; y: number }[]
   stepTimes?: number[]   // wall-clock timestamps (seconds) of each inference step
-  modelLabel?: string    // e.g. "llama-3.2-1B · AR · 12 tok/s"
+  graphTitle?: string    // e.g. "llama-3.2-1B · AR · 12 tok/s"
   activeIndex?: number   // index of the point currently highlighted (-1/undefined = none)
   baseline?: number | null  // draw a horizontal reference line at this y value (e.g. 0)
-  isAttentionTimescale?: false
+  isAttentionTimescale?: boolean
 }>()
 
 const W = 1000
@@ -138,6 +138,12 @@ const xAxisMaxMs = computed(() => {
 })
 
 const yAxisMax = computed(() => props.points.length)
+
+// Attention timescale: the largest (most positive) per-layer DLA score, shown
+// top-left in place of the token count. In that mode each point's y is the
+// layer's Direct Logit Attribution.
+const topDla = computed(() =>
+  props.points.length ? Math.max(...props.points.map(p => p.y)) : 0)
 </script>
 
 <style scoped>
