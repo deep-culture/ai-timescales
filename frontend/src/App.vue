@@ -260,7 +260,6 @@ const tokens = reactive<{ text: string; cls: string }[]>([])
 const heartbeat = reactive<HeartbeatPoint[]>([])
 const stepTimes = reactive<number[]>([])
 let t0 = 0
-let _netCount = 0
 
 // ── model badge
 const _tokensPerSecHistory = reactive<number[]>([])
@@ -729,7 +728,6 @@ async function fetchTtsBuffers(tokenTexts: string[], pans: number[], voice = 'af
   const results = await Promise.all(tokenTexts.map(async (text, i) => {
     if (!text.trim() || SKIP_TOKENS.has(text.trim())) return null
     try {
-      recordNetRequest()
       const res = await fetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -873,7 +871,6 @@ async function fetchTtsBuffersWithVolumes(
   const results = await Promise.all(tokenTexts.map(async (text, i) => {
     if (!text.trim() || SKIP_TOKENS.has(text.trim())) return null
     try {
-      recordNetRequest()
       const voice = voices?.[i] ?? defaultVoice
       const res = await fetch('/api/tts', {
         method: 'POST',
@@ -1463,7 +1460,7 @@ async function runAR() {
     enqueueStep(ev, renderAR)
   })
 
-  genStatus.value = ok ? ['done', 'Done'] : ['warning', genStatus.value]
+  genStatus.value = ok ? ['done', 'Done'] : ['warning', genStatus.value[1]]
   busy.value = false
 }
 
@@ -1471,7 +1468,7 @@ async function runDiffuse() {
   if (busy.value || !online.value || !diffusionModel.value) return
   const msg = userInput.value.trim(); if (!msg) return
   busy.value = true
-  genStatus.value = ('processing', '${diffusionModel.value}…')
+  genStatus.value = ['processing', `${diffusionModel.value}…`]
   tokens.length = 0
   heartbeat.length = 0;
   stepTimes.length = 0
@@ -1485,7 +1482,7 @@ async function runDiffuse() {
   const { ok } = await streamGenerate(diffusionModel.value, msg, [], (ev) => {
     enqueueStep(ev, renderDiffusion)
   })
-  genStatus.value = ok ? ['done', 'Done'] : ['warning', genStatus.value]
+  genStatus.value = ok ? ['done', 'Done'] : ['warning', genStatus.value[1]]
   busy.value = false
 }
 
@@ -1502,7 +1499,7 @@ async function runBoth() {
   prevIds.ar = []; prevIds.diffusion = []
 
   if (arModel.value) {
-    genStatus.value = ('processing', `${arModel.value}…`)
+    genStatus.value = ['processing', `${arModel.value}…`]
     resetRunMetrics(arModel.value, 'AR')
     const { ok } = await streamGenerate(arModel.value, msg, [], (ev) => {
       enqueueStep(ev, renderAR)
@@ -1524,7 +1521,7 @@ async function runBoth() {
     const { ok } = await streamGenerate(diffusionModel.value, msg, [], (ev) => {
       enqueueStep(ev, renderDiffusion)
     })
-    genStatus.value = ok ? ['done', 'Done'] : ['warning', genStatus.value]
+    genStatus.value = ok ? ['done', 'Done'] : ['warning', genStatus.value[1]]
   }
   busy.value = false
 }
