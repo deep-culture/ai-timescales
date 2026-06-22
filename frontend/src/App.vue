@@ -136,13 +136,14 @@
           :baseline="0"
         />
         <div class="attn-graph-caption">
-          <strong>y = Direct Logit Attribution</strong> — how much each attention layer
+          <strong>y = Direct Logit Attribution</strong>: how much each attention layer
           pushes the final output toward the chosen token. The dashed line is zero:
           above it the layer promotes the token, below it the layer suppresses it. It
           projects each layer's attention write to the residual stream through the
           model's final RMSNorm + unembedding onto the chosen token's logit, isolating
           what each attention layer contributes to — i.e. “gets through to” — the output.<br>
-          → x = Eigenzeit (when each layer is reached) · dot = layer currently playing.
+          x = Moment when each layer is reached, measured by CUDA events.<br>
+          dot = layer currently playing.
         </div>
       </template>
 
@@ -1771,8 +1772,8 @@ input[type=number] {
   font-size: 0.7rem;
   color: var(--color-primary);
   opacity: 0.65;
-  text-align: center;
-  margin-top: 0.2rem;
+  text-align: left;
+  margin-top: 0.4rem;
   line-height: 1.4;
 }
 
