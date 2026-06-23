@@ -914,19 +914,9 @@ function playAudioBuffersWithVolumes(items: { buffer: AudioBuffer; pan: number; 
 // ── layer "echo" playback
 // Plays the per-layer attention scores layer-by-layer (first→last). Each layer
 // gets its own TTS voice; a token's amplitude scales with its attention score
-// (loud = attended, whisper = ignored). MASK tokens (diffusion) become white
-// noise. Tokens are panned left→right by their position in the sequence.
+// (loud = attended, whisper = ignored).
+// Tokens are panned left→right by their position in the sequence.
 
-let _noiseBuffer: AudioBuffer | null = null
-function getNoiseBuffer(ctx: AudioContext, dur = 0.35): AudioBuffer {
-  if (_noiseBuffer && _noiseBuffer.sampleRate === ctx.sampleRate) return _noiseBuffer
-  const len = Math.floor(ctx.sampleRate * dur)
-  const buf = ctx.createBuffer(1, len, ctx.sampleRate)
-  const d = buf.getChannelData(0)
-  for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * 0.4
-  _noiseBuffer = buf
-  return buf
-}
 
 // Sources scheduled by the echo playback, kept so a stop can cancel them.
 let _echoSources: AudioBufferSourceNode[] = []
@@ -939,26 +929,6 @@ function playAudioBuffersAt(items: { buffer: AudioBuffer; pan: number; volume: n
     try {
       const src = ctx.createBufferSource()
       src.buffer = buffer
-      const gainNode = ctx.createGain()
-      gainNode.gain.value = volume * ttsVolume.value
-      const panner = ctx.createStereoPanner()
-      panner.pan.value = pan
-      src.connect(panner); panner.connect(gainNode); gainNode.connect(ctx.destination)
-      src.start(startTime)
-      _echoSources.push(src)
-    } catch { /* best-effort */ }
-  }
-}
-
-// Schedule a burst of white-noise "tokens" (masks) at an absolute time.
-function playNoiseAt(noise: { pan: number; volume: number }[], startTime: number): void {
-  if (!noise.length) return
-  const ctx = getAudioCtx()
-  const buf = getNoiseBuffer(ctx)
-  for (const { pan, volume } of noise) {
-    try {
-      const src = ctx.createBufferSource()
-      src.buffer = buf
       const gainNode = ctx.createGain()
       gainNode.gain.value = volume * ttsVolume.value
       const panner = ctx.createStereoPanner()
@@ -1010,12 +980,12 @@ function getLayerRow(layers: LayerData, l: number, rowIdx?: number): number[] {
     rows.reduce((s, r) => s + (r[i] ?? 0), 0) / rows.length)
 }
 
-// Build one layer's playback: attention-weighted TTS tokens + noise (masks).
+// Build one layer's playback: attention-weighted TTS tokens.
 // Iterates the FULL sequence (prompt + response): prompt words are spoken at
-// their attention weight, special/template tokens are muted, masks → noise, and
+// their attention weight, special/template tokens are muted, and
 // each token's voice follows its sequence position.
 function buildLayerSchedule(ev: StepEvent, layers: LayerData, l: number):
-  { texts: string[]; pans: number[]; vols: number[]; voices: string[]; noise: { pan: number; volume: number }[] } {
+  { texts: string[]; pans: number[]; vols: number[]; voices: string[];} {
   const PL = promptLen(ev)
   const isDiff = layers.diffusion
   const respTexts = isDiff ? ev.decoded_tokens : (arAttnTokens as string[])
@@ -1026,18 +996,16 @@ function buildLayerSchedule(ev: StepEvent, layers: LayerData, l: number):
   const norm = Math.max(...row.slice(0, T).filter((_, d) => d !== q && !maskSet.has(d)), 1e-9)
 
   const texts: string[] = [], pans: number[] = [], vols: number[] = [], voices: string[] = []
-  const noise: { pan: number; volume: number }[] = []
   for (let d = 0; d < T; d++) {
     if (d === q) continue
     const pan = panForIndex(d, T)
     const v = (row[d] ?? 0) / norm
-    if (maskSet.has(d)) { noise.push({ pan, volume: Math.min(1, v || 0.3) }); continue }
     if (isSpecialAt(ev, d)) continue            // mute special/template tokens
     const text = d < PL ? (ev.prompt_tokens?.[d] ?? '') : respTexts[d - PL]
     if (!text || !text.trim()) continue
     texts.push(text); pans.push(pan); vols.push(v); voices.push(tokenVoice(d))
   }
-  return { texts, pans, vols, voices, noise }
+  return { texts, pans, vols, voices }
 }
 
 // Per-layer start offsets (seconds, relative to the first layer).
@@ -1151,7 +1119,6 @@ async function playLayerEchoes() {
     for (let l = 0; l < L; l++) {
       const at = startAt + offsets[l]
       playAudioBuffersAt(bufsPerLayer[l], at)
-      playNoiseAt(scheds[l].noise, at)
       // Sweep the blur to this layer in step with its audio (same lead/offset).
       _echoTimers.push(window.setTimeout(() => {
         echoLayer.value = l
@@ -1383,7 +1350,7 @@ async function playDiffusionAttentionTTS(ev: StepEvent) {
   }
 
   // Other tokens across the FULL sequence: prompt words + response tokens,
-  // muting special/template tokens (masks are handled as noise during echoes).
+  // muting special/template tokens.
   const otherIdxs: number[] = [], otherTexts: string[] = [], otherPans: number[] = []
   for (let d = 0; d < T; d++) {
     if (d === sel || maskSet.has(d) || isSpecialAt(ev, d)) continue
@@ -1852,7 +1819,7 @@ input[type=number] {
   border-bottom-color: var(--color-accent);
 }
 .btn.status.warning {
-  color: var(--color-waring);
+  color: var(--color-warning);
   border-bottom-color: var(--color-warning);
 }
 
