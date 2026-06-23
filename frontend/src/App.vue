@@ -1,7 +1,7 @@
 <template>
   <div v-if="loginRequired && !loggedIn" class="login-overlay">
     <form class="login-box" @submit.prevent="doLogin">
-      <h2>EigenzAIt</h2>
+      <h2>AI Timescales</h2>
       <p v-if="loginError" class="login-error">{{ loginError }}</p>
       <label>Username<input v-model="loginUser" type="text" autocomplete="username" /></label>
       <label>Password<input v-model="loginPass" type="password" autocomplete="current-password" /></label>
@@ -11,7 +11,7 @@
 
   <template v-else>
   <header>
-    <span class="title"><strong>EigenzAIt</strong></span>
+    <span class="title"><strong>AI Timescales</strong></span>
     <span :class="['dot', online ? 'on' : 'off']">●</span>
     <span class="status-text">{{ statusText }}</span>
   </header>
