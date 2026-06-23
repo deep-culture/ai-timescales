@@ -161,10 +161,6 @@ const topDla = computed(() =>
 <style scoped>
 .heartbeat-wrap {
   position: relative;
-  /* Reserve a row beneath the tick marks for the 0ms / max-ms labels so they
-     never overlap the ticks. The layer cursor compensates by the same amount. */
-  --ms-row-h: 1.15rem;
-  padding-bottom: var(--ms-row-h);
 }
 
 .heartbeat {

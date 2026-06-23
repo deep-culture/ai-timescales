@@ -141,14 +141,14 @@
 
       <!-- heartbeat graph -->
       <HeartbeatGraph
-        v-if="timescale !== 'attention'"
+        v-if="timescale === 'inference'"
         :points="heartbeat"
         :stepTimes="stepTimes"
         :graphTitle="graphTitle"
       />
       <!-- attention timescale: per-layer "heartbeat" on the Eigenzeit axis,
            with a dot marking the layer currently sonified -->
-      <template v-else-if="attnPoints.length">
+      <template v-else-if="timescale === 'attention'">
         <HeartbeatGraph
           :points="attnPoints"
           :stepTimes="attnLayerTimes"
@@ -1743,6 +1743,7 @@ button:not(:disabled):hover {
 .output {
   min-height: 5em;
   margin-top: 1rem;
+  margin-bottom: 1rem;
   font-size: 2rem;
   line-height: 2rem;
 }
@@ -1813,7 +1814,7 @@ input[type=number] {
   color: var(--color-primary);
   opacity: 0.65;
   text-align: left;
-  margin-top: 1rem;
+  margin-top: 1.5rem;
   line-height: 1.4;
 }
 
