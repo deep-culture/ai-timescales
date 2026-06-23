@@ -1,11 +1,12 @@
-# EigenzAIt
+# AI Timescales
 
-A dual-model comparison UI that streams token generation from an autoregressive and a diffusion language model (LLaDA) side by side, with real-time TTS vocalization.
+AI Timescales lets you listen to the timescales of inference and attention of two model architectures: autoregressive and diffusion language models.
 
 <em>Click for audio</em>
-<a href="https://deep-culture.org/eigenzait/ar-lm-inference.mp4" target="_blank"><img width="1274" height="880" alt="ar-lm-generation" src="https://github.com/user-attachments/assets/89fa4f29-3aa6-460f-89d8-7744b6775be5" /></a>
+<a href="https://deep-culture.org/ai-timesscales/ar-lm-inference.mp4" target="_blank"><img width="1274" height="880" alt="ar-lm-generation" src="https://github.com/user-attachments/assets/89fa4f29-3aa6-460f-89d8-7744b6775be5" /></a>
 
-<a href="https://deep-culture.org/eigenzait/dlm-inference.mp4" target="_blank"><img width="1282" height="882" alt="dlm-generation" src="https://github.com/user-attachments/assets/80e00290-9ff9-4678-b069-6d9679b702c4" /></a>
+<em>Click for audio</em>
+<a href="https://deep-culture.org/ai-timescales/dlm-inference.mp4" target="_blank"><img width="1282" height="882" alt="dlm-generation" src="https://github.com/user-attachments/assets/80e00290-9ff9-4678-b069-6d9679b702c4" /></a>
 
 
 ## Requirements
@@ -32,30 +33,28 @@ pip install -r requirements.txt
 cd frontend
 npm install
 ```
-If you need to upgrade Node.js, do
-
-```bash
-curl -o- https://raw.githubusercontent.com/creationix/nvm/v0.33.8/install.sh | bash
-nvm install node
-````
+You may need to upgrade Node JS.
 
 ### 3. Environment variables
 
 Create `.env`:
 
 ```env
-HF_TOKEN=hf_...          # HuggingFace token
-API_KEY=your_secret      # shared secret between frontend proxy and backend
-# Optional — skip loading a model:
-# DO_NOT_LOAD_AR=true
-# DO_NOT_LOAD_DIFFUSION=true
+HF_TOKEN='hf_...'          		# HuggingFace token
+API_KEY='your_secret'      		# Shared secret between frontend proxy and backend
+LOGIN_USER=""					# Username needed for login (optional)
+LOGIN_PASSWORD=""				# Password needed for login (optional)
+# DO_NOT_LOAD_AR=true    		# Skip loading AR
+# DO_NOT_LOAD_DIFFUSION=true	# skip loading diffusion
+# AR_MODEL="meta-llama/Llama-3.1-8B-Instruct"	# which AR-LM to use
+# HF_HOME="path/to/huggingface/cache"			# set to current dir if absent
 ```
 
 Copy `.env-example` into `.env` and set the credentials.
 
-You'll need a HuggingFace token with access to the [LLaMA 3.2](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) model. Request access on the model page if you don't have it yet.
+You'll need a HuggingFace token with access to the [Llama](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) model. Request access on the model page if you don't have it yet.
 
-Set `LOGIN_USER` and `LOGIN_PASSWORD` in `.env` if you want to enable the optional login gate.
+Set `LOGIN_USER` and `LOGIN_PASSWORD` in `.env` if you want to enable the optional login.
 
 ---
 
