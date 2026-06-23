@@ -60,7 +60,7 @@ print(f"[server] HF_HOME = {os.environ['HF_HOME']}", flush=True)
 
 from inference import LLaDAGenerator, LlamaGenerator
 from inference.base import BaseGenerator
-from inference.llada import EOS_ID
+from inference.llada import EOS_ID, MASK_ID
 
 # ── global cancellation flag (one generation at a time) ──────────────────
 _cancel = threading.Event()
@@ -342,7 +342,10 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
     # and attends over the prompt + chat-template/special tokens too, so expose
     # them (decoded individually, specials kept) alongside a per-token "is special"
     # mask. Cheap (prompt is short) and only needed when capturing attention.
-    _special_ids = set(getattr(gen.tokenizer, "all_special_ids", []) or [])
+    # LLaDA's mask sentinel (MASK_ID, "<|mdm_mask|>") is NOT in the tokenizer's
+    # all_special_ids, so include it explicitly — otherwise it renders as a plain
+    # prompt token and gets sonified ("MDMask") instead of being muted.
+    _special_ids = set(getattr(gen.tokenizer, "all_special_ids", []) or []) | {MASK_ID}
     _prompt_id_list = prompt[0].tolist() if req.return_attention else []
     _prompt_tokens = [gen.decode_ids([t]) for t in _prompt_id_list]
     _prompt_specials = [bool(t in _special_ids) for t in _prompt_id_list]
