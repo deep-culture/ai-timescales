@@ -724,27 +724,58 @@ const SKIP_TOKENS = new Set(['<|endoftext|>', '<|eot_id|>', '<|end_header_id|>',
 
 let _audioCtx: AudioContext | null = null
 function getAudioCtx(): AudioContext {
-  if (!_audioCtx || _audioCtx.state === 'closed') _audioCtx = new AudioContext()
+  if (!_audioCtx || _audioCtx.state === 'closed') {
+    _audioCtx = new AudioContext()
+    _ttsBufferCache.clear()   // decoded buffers belong to a context — start fresh
+  }
   if (_audioCtx.state === 'suspended') _audioCtx.resume()
   return _audioCtx
 }
 
-// Fetch TTS for a list of token texts; returns decoded AudioBuffers with their pan positions
-async function fetchTtsBuffers(tokenTexts: string[], pans: number[], voice = 'af_heart'): Promise<{ buffer: AudioBuffer; pan: number }[]> {
+// Persistent cache of decoded TTS buffers, keyed by voice|speed|text. The WAV
+// for a token is volume-independent (gain is applied per playback via a
+// GainNode), so the same decoded buffer can be reused across attention layers,
+// denoising steps, and replays. The echo playback in particular asks for the
+// same (text, voice) on all 32 layers — without this it re-fetched and
+// re-decoded each one; with it, every token is fetched + decoded at most once.
+// Storing the in-flight Promise also dedups concurrent requests for the same
+// token (e.g. the 32 layers firing together).
+const _ttsBufferCache = new Map<string, Promise<AudioBuffer | null>>()
+
+// Fetch + decode a single token's TTS buffer, deduplicated and cached. Returns
+// null when there's no audio (empty/skip token, 204, or a transient failure).
+// Failures resolve to null but are NOT kept in the cache, so a later play can
+// retry them; successful buffers stay cached for the session.
+function getTtsBuffer(text: string, voice: string, speed = 1.2): Promise<AudioBuffer | null> {
+  const t = text.trim()
+  if (!t || SKIP_TOKENS.has(t)) return Promise.resolve(null)
+  const key = `${voice}|${speed}|${t}`
+  const cached = _ttsBufferCache.get(key)
+  if (cached) return cached
   const ctx = getAudioCtx()
-  const results = await Promise.all(tokenTexts.map(async (text, i) => {
-    if (!text.trim() || SKIP_TOKENS.has(text.trim())) return null
+  const p = (async () => {
     try {
       const res = await fetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ text: text.trim(), voice }),
+        body: JSON.stringify({ text: t, voice, speed }),
       })
       if (!res.ok || res.status === 204) return null
       const ab = await res.arrayBuffer()
-      const buffer = await ctx.decodeAudioData(ab)
-      return { buffer, pan: pans[i] ?? 0 }
+      return await ctx.decodeAudioData(ab)
     } catch { return null }
+  })()
+  _ttsBufferCache.set(key, p)
+  // Drop unsuccessful results so they aren't permanently silenced.
+  p.then(buf => { if (buf === null && _ttsBufferCache.get(key) === p) _ttsBufferCache.delete(key) })
+  return p
+}
+
+// Fetch TTS for a list of token texts; returns decoded AudioBuffers with their pan positions
+async function fetchTtsBuffers(tokenTexts: string[], pans: number[], voice = 'af_heart'): Promise<{ buffer: AudioBuffer; pan: number }[]> {
+  const results = await Promise.all(tokenTexts.map(async (text, i) => {
+    const buffer = await getTtsBuffer(text, voice)
+    return buffer ? { buffer, pan: pans[i] ?? 0 } : null
   }))
   return results.filter((b): b is { buffer: AudioBuffer; pan: number } => b !== null)
 }
@@ -876,22 +907,10 @@ async function fetchTtsBuffersWithVolumes(
   volumes: number[],
   voices?: string[],
 ): Promise<{ buffer: AudioBuffer; pan: number; volume: number }[]> {
-  const ctx = getAudioCtx()
   const defaultVoice = availableVoices.value[0] ?? 'af_heart'
   const results = await Promise.all(tokenTexts.map(async (text, i) => {
-    if (!text.trim() || SKIP_TOKENS.has(text.trim())) return null
-    try {
-      const voice = voices?.[i] ?? defaultVoice
-      const res = await fetch('/api/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ text: text.trim(), voice }),
-      })
-      if (!res.ok || res.status === 204) return null
-      const ab = await res.arrayBuffer()
-      const buffer = await ctx.decodeAudioData(ab)
-      return { buffer, pan: pans[i] ?? 0, volume: volumes[i] ?? 1 }
-    } catch { return null }
+    const buffer = await getTtsBuffer(text, voices?.[i] ?? defaultVoice)
+    return buffer ? { buffer, pan: pans[i] ?? 0, volume: volumes[i] ?? 1 } : null
   }))
   return results.filter((b): b is { buffer: AudioBuffer; pan: number; volume: number } => b !== null)
 }
