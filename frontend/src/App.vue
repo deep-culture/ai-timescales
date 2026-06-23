@@ -720,7 +720,7 @@ async function streamGenerate(
 // Generation runs freely; TTS fetches fire in parallel; display waits per-step
 // until its audio is ready, then plays + renders simultaneously.
 
-const SKIP_TOKENS = new Set(['<|endoftext|>', '<|eot_id|>', '<|end_header_id|>', '<eos>', '<s>', '</s>', '<pad>'])
+const SKIP_TOKENS = new Set(['<|endoftext|>', '<|eot_id|>', '<|start_header_id|>', '<|end_header_id|>', '<eos>', '<s>', '</s>', '<pad>'])
 
 let _audioCtx: AudioContext | null = null
 function getAudioCtx(): AudioContext {
@@ -1742,7 +1742,7 @@ button:not(:disabled):hover {
 
 .output {
   min-height: 5em;
-  margin-top: 1rem;
+  margin-top: 2rem;
   margin-bottom: 1rem;
   font-size: 2rem;
   line-height: 2rem;
