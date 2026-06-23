@@ -1087,12 +1087,16 @@ const attnLayerTimes = computed<number[]>(() => {
 })
 
 const attnGraphLabel = computed(() => {
-  const layers = echoStep.value?.layers
-  if (!layers) return ''
-  let modelName = _currentRunModel.value
-  if (!modelName) return ''
-  modelName = modelName.split('/').pop() ?? modelName
-  return `${modelName} · ${layers.n_layers} layers`
+  // Same shape as the inference badge ("model · …"), but the trailing metric is
+  // which generation step's attention is on screen: the token number for AR or
+  // the denoising-step number for the DLM.
+  const m = _currentRunModel.value
+  if (!m) return ''
+  const short = m.split('/').pop() ?? m
+  if (_currentRunType.value === 'diffusion') {
+    return `${short} · denoising step ${diffStepIdx.value}`
+  }
+  return `${short} · token ${arAttnTokens.length}`
 })
 
 let _echoWaitTimer: number | undefined
@@ -1209,6 +1213,9 @@ async function nextARStep() {
   if (!msg && arAttnIds.value.length === 0) return
   busy.value = true
   genStatus.value = ['processing', 'Next AR token…']
+  // Drive the attention-graph badge (model + token count).
+  _currentRunModel.value = arModel.value
+  _currentRunType.value = 'AR'
 
   // Begin a fresh sequence on the first step OR whenever the prompt was edited
   // since this run started — a changed prompt should autoregress anew rather
@@ -1318,6 +1325,9 @@ async function nextARStep() {
 // batch path but starts instantly and ships one step's data at a time).
 async function nextDiffStep() {
   if (busy.value || !online.value || !diffusionModel.value) return
+  // Drive the attention-graph badge (model + denoising-step count).
+  _currentRunModel.value = diffusionModel.value
+  _currentRunType.value = 'diffusion'
 
   const msg = userInput.value.trim()
   const total = steps.value

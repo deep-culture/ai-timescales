@@ -8,7 +8,7 @@
       <div class="top-left" v-else>{{ topDla.toFixed(2) }} DLA</div>
       <!-- X-axis labels -->
       <div class="bottom-left">0ms</div>
-      <div class="bottom-right">{{ xAxisMaxMs }}ms</div>
+      <div class="bottom-right">{{ xAxisMaxLabel }}ms</div>
     </div>
 
     <svg
@@ -130,11 +130,23 @@ const tickPositions = computed(() => {
   return times.map(t => ((t - xMin) / xRange) * W)
 })
 
+// X-axis span in milliseconds (the unit is correct: stepTimes are seconds, so
+// ×1000 = ms — for inference this is the wall-clock run length, for the
+// attention timescale it's the per-layer eigenzeit span).
 const xAxisMaxMs = computed(() => {
   const times = props.stepTimes
   if (!times?.length) return 0
+  return (times[times.length - 1] - times[0]) * 1000
+})
 
-  return Math.round((times[times.length - 1] - times[0]) * 1000)
+// Adaptive precision so sub-millisecond eigenzeit spans (attention timescale)
+// don't collapse to a misleading "0ms"; large inference spans stay integer.
+const xAxisMaxLabel = computed(() => {
+  const v = xAxisMaxMs.value
+  if (v >= 100) return Math.round(v).toString()
+  if (v >= 10)  return v.toFixed(1)
+  if (v >= 1)   return v.toFixed(2)
+  return v.toFixed(3)
 })
 
 const yAxisMax = computed(() => props.points.length)
@@ -149,6 +161,10 @@ const topDla = computed(() =>
 <style scoped>
 .heartbeat-wrap {
   position: relative;
+  /* Reserve a row beneath the tick marks for the 0ms / max-ms labels so they
+     never overlap the ticks. The layer cursor compensates by the same amount. */
+  --ms-row-h: 1.15rem;
+  padding-bottom: var(--ms-row-h);
 }
 
 .heartbeat {
@@ -168,7 +184,8 @@ const topDla = computed(() =>
 /* active-layer cursor — subtle dot along the bottom, animates L→R */
 .layer-cursor {
   position: absolute;
-  bottom: 1px;
+  /* Sit at the content bottom (by the ticks), above the reserved ms-label row. */
+  bottom: calc(var(--ms-row-h) + 1px);
   width: 9px;
   height: 9px;
   margin-left: -4.5px;     /* centre on the data point */
@@ -199,12 +216,12 @@ const topDla = computed(() =>
 
 .axis-labels .bottom-left {
   position: absolute;
-  bottom: 8px;
+  bottom: 0;          /* in the reserved row, below the tick marks */
 }
 
 .axis-labels .bottom-right {
   position: absolute;
-  bottom: 8px;
+  bottom: 0;          /* in the reserved row, below the tick marks */
   right: 0;
 }
 </style>
