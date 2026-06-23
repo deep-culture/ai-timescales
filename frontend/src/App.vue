@@ -184,7 +184,7 @@
     </div>
     <footer>
       <a href="https://deep-culture.org">
-        <img src="./assets/deep-culture.png">
+        <img src="./assets/deep-culture.png" alt="Deep Culture"/>
       </a>
     </footer>
   </main>
@@ -197,14 +197,17 @@ import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import HeartbeatGraph from './components/HeartbeatGraph.vue'
 
 // ── types
-// Per-layer "attention echoes" — present only on the final step of a sequence.
+// Per-layer "attention echoes" — carried by every step now (replayed for the
+// step currently in view, not just the final one).
 interface LayerData {
   n_layers: number
   n_heads: number
   timings_ns: number[]                          // per-layer GPU-execution Eigenzeit (ns offsets, layer 0 = 0)
   diffusion: boolean
-  attention: number[][] | number[][][]          // per-layer mean: (L,T) AR or (L,gen,gen) DLM
-  attention_heads: number[][][] | number[][][][] // per-layer per-head: (L,H,T) or (L,H,gen,gen)
+  attention: number[][] | number[][][]          // per-layer mean: (L,T) AR or (L,gen,T) DLM
+  // Per-layer per-head — AR only. Diffusion echoes are head-reduced server-side
+  // (averaged over the selected heads), so this is absent for diffusion.
+  attention_heads?: number[][][] | number[][][][] // (L,H,T) AR
   dla?: number[] | number[][]                   // direct logit attribution: (L,) AR or (L,gen) DLM
 }
 
@@ -986,7 +989,10 @@ function tokenVoice(i: number): string {
 // Per-layer attention row, averaged over the active head selection.
 // rowIdx: undefined = AR (full last row); number = DLM (selected-token row).
 function getLayerRow(layers: LayerData, l: number, rowIdx?: number): number[] {
-  const useMean = headAvg.value || selectedHeads.size === 0
+  // Diffusion echoes carry no per-head data (it's averaged over the selected
+  // heads server-side), so `layers.attention` already reflects the selection —
+  // fall back to it whenever per-head data is absent.
+  const useMean = headAvg.value || selectedHeads.size === 0 || !layers.attention_heads
   const isDiff = rowIdx !== undefined
   if (useMean) {
     const a = layers.attention as any
@@ -1322,12 +1328,15 @@ async function nextDiffStep() {
       temperature: temperature.value,
       tts: false,
       return_attention: true,
+      // The per-layer echoes are head-reduced server-side, so the head
+      // selection active when a run starts is baked into every step's echo
+      // (empty = avg over all heads). Changing heads later re-blurs the live
+      // view instantly but, for the echoes, takes effect on the next run.
+      echo_head_indices: (headAvg.value || selectedHeads.size === 0) ? [] : [...selectedHeads],
     })
 
     for (const s of allSteps) diffStepBuffer.push(s)
     diffGenerationDone.value = true
-    // The final step carries every layer's attention — use it for echo playback.
-    echoStep.value = [...allSteps].reverse().find(s => s.layers) ?? null
 
     if (!diffStepBuffer.length) { busy.value = false; genStatus.value = ['warning', 'No steps']; return }
   } else {
@@ -1339,6 +1348,9 @@ async function nextDiffStep() {
   diffStepIdx.value++
   diffCurrentAttn.value = (ev.attention as number[][] | undefined) ?? null
   lastStep.value = ev
+  // Echoes replay the step the user is looking at — every step now carries its
+  // own per-layer attention, so point the echo at this step (not the final one).
+  if (ev.layers) echoStep.value = ev
 
   // Render diffusion tokens + update blur
   renderDiffusion(ev)

@@ -164,16 +164,24 @@ def set_capture(model, flag: bool) -> None:
 
 def collect_layer_attention(
     model,
+    head_indices: Optional[List[int]] = None,
 ) -> Tuple[Optional[torch.Tensor], List[int]]:
     """
     Gather every block's stored attention weights into one tensor and read back
     the per-layer Eigenzeit from its CUDA timing event, then release the GPU
     copies.
 
-    Returns ``(attn, timings_ns)`` where ``attn`` is ``(n_layers, n_heads, T, T)``
-    on the CPU (float32, batch index 0) and ``timings_ns`` is one ns offset per
-    layer (GPU execution time relative to layer 0; CPU fallback when no CUDA).
-    Returns ``(None, [])`` if any block has no weights stored (e.g. a
+    The head dimension is collapsed *on the GPU* before the copy to host:
+    ``head_indices`` selects which heads to average (empty/None = all heads, i.e.
+    the "avg" view). This is the per-layer "attention echo" data, and reducing
+    heads here means each denoising step ships ``(n_layers, T, T)`` instead of
+    ``(n_layers, n_heads, T, T)`` — an ``n_heads`` × saving that makes capturing
+    every step (not just the last) affordable.
+
+    Returns ``(attn, timings_ns)`` where ``attn`` is ``(n_layers, T, T)`` on the
+    CPU (float32, batch index 0 = conditional pass) and ``timings_ns`` is one ns
+    offset per layer (GPU execution time relative to layer 0; CPU fallback when
+    no CUDA). Returns ``(None, [])`` if any block has no weights stored (e.g. a
     flash-attention path that can't expose them).
     """
     from inference.base import gpu_event_offsets_ns  # local: avoid import cycle
@@ -182,17 +190,26 @@ def collect_layer_attention(
     weights: List[torch.Tensor] = []
     events: List[Optional[torch.cuda.Event]] = []
     fallback_ns: List[int] = []
+    idx: Optional[torch.Tensor] = None
     for blk in blocks:
         w = getattr(blk, "_attn_weights", None)
         if w is None:
             return None, []
-        # w: (B, n_heads, T, T) — keep the first batch item (conditional pass).
-        weights.append(w[0].detach().to("cpu", torch.float32))
+        # w: (B, n_heads, T, T) — keep the first batch item (conditional pass)
+        # and average over the requested heads while still on the GPU.
+        a = w[0]  # (n_heads, T, T)
+        if head_indices:
+            if idx is None:
+                idx = torch.tensor(head_indices, device=a.device, dtype=torch.long)
+            a = a.index_select(0, idx).mean(0)  # (T, T)
+        else:
+            a = a.mean(0)                        # (T, T) — all heads
+        weights.append(a.detach().to("cpu", torch.float32))
         events.append(getattr(blk, "_attn_start_event", None))
         fallback_ns.append(int(getattr(blk, "_attn_time_ns", 0)))
         blk._attn_weights = None  # free the GPU copy now that it's been read
     timings = gpu_event_offsets_ns(events, fallback_ns)
-    return torch.stack(weights, dim=0), timings
+    return torch.stack(weights, dim=0), timings  # (n_layers, T, T)
 
 
 def collect_layer_outputs(model) -> Optional[torch.Tensor]:

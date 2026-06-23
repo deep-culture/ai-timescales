@@ -181,6 +181,11 @@ class GenerateRequest(BaseModel):
     remasking: str = "low_confidence"
     tts: bool = True
     return_attention: bool = True
+    echo_head_indices: list[int] = Field(
+        default_factory=list,
+        description="Heads to average for the per-layer attention echoes (empty = all heads / avg). "
+                    "Applied server-side so each step ships (L,T,T) instead of (L,H,T,T).",
+    )
     continue_only: bool = Field(
         default=False,
         description="If true, use prev_token_ids as the full prompt directly (skip chat template).",
@@ -359,6 +364,7 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                     cfg_scale=req.cfg_scale,
                     remasking=req.remasking,
                     return_attention=req.return_attention,
+                    echo_head_indices=req.echo_head_indices,
                 ):
                     if _cancel.is_set():
                         break   # stop between steps; current CUDA op finishes cleanly
@@ -433,31 +439,41 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                     step_data["attention"] = mean_attn[pl:, ks:].float().tolist()
                     step_data["attention_heads"] = attn[:, pl:, ks:].float().tolist()
 
-            # ── second timescale: per-layer "attention echoes" (final step) ──
+            # ── second timescale: per-layer "attention echoes" (every step) ──
             # One self-contained object carrying every layer's attention plus
-            # the per-layer timings, so the frontend can replay layer-by-layer.
+            # the per-layer timings, so the frontend can replay layer-by-layer
+            # for whichever step is currently in view.
             if req.return_attention and item.attention_layers is not None:
                 is_diffusion = isinstance(gen, LLaDAGenerator)
-                al = item.attention_layers           # (n_layers, n_heads, T, T)
-                layers_obj: dict = {
-                    "n_layers":   int(al.shape[0]),
-                    "n_heads":    int(al.shape[1]),
-                    "timings_ns": [int(t) for t in item.layer_timings_ns],
-                    "diffusion":  is_diffusion,
-                }
+                al = item.attention_layers
                 ks = _n_sink                # leading sink (BOS) key columns to drop
                 if is_diffusion:
-                    # gen-token queries, full-sequence keys (prompt + specials
-                    # included): heads → (L,H,gen,T), mean → (L,gen,T)
+                    # Diffusion echoes are pre-averaged over the requested head
+                    # selection on the GPU, so ``al`` is already (n_layers, T, T).
+                    # We ship one mean row-block per layer — gen-token queries,
+                    # full-sequence keys (prompt + specials) → (L, gen, T). No
+                    # per-head data: the head selection is baked in upstream,
+                    # which keeps every step's payload H× smaller.
                     pl2 = gen._prompt_len
-                    per_head = al[:, :, pl2:, ks:]
-                    layers_obj["attention_heads"] = per_head.tolist()
-                    layers_obj["attention"] = per_head.mean(1).tolist()
+                    layers_obj: dict = {
+                        "n_layers":   int(al.shape[0]),
+                        "n_heads":    1,
+                        "timings_ns": [int(t) for t in item.layer_timings_ns],
+                        "diffusion":  True,
+                        "attention":  al[:, pl2:, ks:].tolist(),   # (L, gen, T)
+                    }
                 else:
-                    # AR: last row per layer → heads (L,H,T), mean (L,T)
+                    # AR: ``al`` is (n_layers, n_heads, T, T). Last row per layer
+                    # → heads (L,H,T), mean (L,T).
                     per_head = al[:, :, -1, ks:]
-                    layers_obj["attention_heads"] = per_head.tolist()
-                    layers_obj["attention"] = per_head.mean(1).tolist()
+                    layers_obj = {
+                        "n_layers":        int(al.shape[0]),
+                        "n_heads":         int(al.shape[1]),
+                        "timings_ns":      [int(t) for t in item.layer_timings_ns],
+                        "diffusion":       False,
+                        "attention_heads": per_head.tolist(),
+                        "attention":       per_head.mean(1).tolist(),
+                    }
                 # Direct logit attribution per layer: (L,) for AR, (L,gen) for DLM.
                 if item.attention_dla is not None:
                     layers_obj["dla"] = item.attention_dla.tolist()

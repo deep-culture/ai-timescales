@@ -10,7 +10,6 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
 from LLaDA.patch_llada import (
-    clear_layer_buffers,
     collect_layer_attention,
     collect_layer_outputs,
     patch_model,
@@ -119,6 +118,7 @@ class LLaDAGenerator(BaseGenerator):
         cfg_scale: float = 0.0,
         remasking: str = "low_confidence",
         return_attention: bool = False,
+        echo_head_indices: list[int] | None = None,
     ) -> Iterator[StepResult]:
         self.free_memory()  # release previous run's tensors before allocating new ones
 
@@ -161,7 +161,6 @@ class LLaDAGenerator(BaseGenerator):
             num_transfer = _get_num_transfer_tokens(block_mask_index, steps_per_block)
 
             for i in range(steps_per_block):
-                is_final_step = (num_block == num_blocks - 1) and (i == steps_per_block - 1)
                 mask_index = x == MASK_ID
 
                 if cfg_scale > 0.0:
@@ -180,38 +179,42 @@ class LLaDAGenerator(BaseGenerator):
                 logits = logits.to(self.device)
 
                 # ── attention capture ────────────────────────────────────
-                # Every block now stores its weights (patch_model). Each step
-                # we keep the last layer for the live blur view and free the
-                # other blocks' GPU copies. Only on the *final* step do we
-                # gather all 32 layers + their per-layer timings for playback.
+                # Every block stores its weights each forward (patch_model). We
+                # now capture the full per-layer "echo" on EVERY step — not just
+                # the last — so the echo playback can replay the step the user is
+                # actually looking at. To keep that affordable, the per-layer
+                # echo is pre-averaged over the requested head selection on the
+                # GPU (→ (L,T,T) per step). We still keep the last layer's
+                # per-head weights separately for the live blur view + the
+                # interactive head selector on the current step.
                 attn: torch.Tensor | None = None
                 attn_layers: torch.Tensor | None = None
                 layer_timings: list[int] = []
                 attention_dla: torch.Tensor | None = None
                 if return_attention:
                     blocks = self.model.model.transformer.blocks
-                    if is_final_step:
-                        attn_layers, layer_timings = collect_layer_attention(self.model)
-                        if attn_layers is not None:
-                            attn = attn_layers[-1]  # (n_heads, T, T)
-                        # ── direct logit attribution per layer ───────────────
-                        outs = collect_layer_outputs(self.model)   # (L, T, C) on device
-                        if outs is not None and self._final_resid is not None:
-                            gen = slice(prompt_len, prompt_len + gen_length)
-                            target_ids = torch.argmax(logits[0, gen], dim=-1)  # (gen_len,)
-                            attention_dla = rms_logit_attribution(
-                                outs[:, gen, :],               # (L, gen_len, C)
-                                self._final_resid[0, gen],     # (gen_len, C)
-                                ln_f.weight,
-                                float(getattr(ln_f, "eps", 1e-5)),
-                                self.model.model.transformer.ff_out.weight,
-                                target_ids,
-                            ).cpu()                            # (L, gen_len)
-                    else:
-                        last_w = getattr(blocks[-1], "_attn_weights", None)
-                        if last_w is not None:
-                            attn = last_w[0].detach().to("cpu", torch.float32)
-                        clear_layer_buffers(self.model)  # release GPU copies each step
+                    # Live merged view: last layer, per-head (read before collect
+                    # frees the buffers below).
+                    last_w = getattr(blocks[-1], "_attn_weights", None)
+                    if last_w is not None:
+                        attn = last_w[0].detach().to("cpu", torch.float32)  # (H,T,T)
+                    # Per-step echoes: every layer, head-reduced → (L,T,T).
+                    attn_layers, layer_timings = collect_layer_attention(
+                        self.model, head_indices=echo_head_indices
+                    )
+                    # ── direct logit attribution per layer (echo "heartbeat") ──
+                    outs = collect_layer_outputs(self.model)   # (L, T, C) on device
+                    if outs is not None and self._final_resid is not None:
+                        gen = slice(prompt_len, prompt_len + gen_length)
+                        target_ids = torch.argmax(logits[0, gen], dim=-1)  # (gen_len,)
+                        attention_dla = rms_logit_attribution(
+                            outs[:, gen, :],               # (L, gen_len, C)
+                            self._final_resid[0, gen],     # (gen_len, C)
+                            ln_f.weight,
+                            float(getattr(ln_f, "eps", 1e-5)),
+                            self.model.model.transformer.ff_out.weight,
+                            target_ids,
+                        ).cpu()                            # (L, gen_len)
 
                 logits_noisy = _add_gumbel_noise(logits, temperature)
                 x0 = torch.argmax(logits_noisy, dim=-1)

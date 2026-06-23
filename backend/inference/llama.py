@@ -145,6 +145,7 @@ class LlamaGenerator(BaseGenerator):
         cfg_scale: float = 0.0,
         remasking: str = "low_confidence",
         return_attention: bool = False,
+        echo_head_indices: list[int] | None = None,  # diffusion-only; AR keeps per-head echoes
     ) -> Iterator[StepResult]:
         self.free_memory()  # release previous run's tensors before allocating new ones
 
