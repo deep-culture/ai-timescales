@@ -2,6 +2,12 @@
 
 A dual-model comparison UI that streams token generation from an autoregressive and a diffusion language model (LLaDA) side by side, with real-time TTS vocalization.
 
+<em>Click for audio</em>
+<a href="https://deep-culture.org/eigenzait/ar-lm-inference.mp4" target="_blank"><img width="1274" height="880" alt="ar-lm-generation" src="https://github.com/user-attachments/assets/89fa4f29-3aa6-460f-89d8-7744b6775be5" /></a>
+
+<a href="https://deep-culture.org/eigenzait/dlm-inference.mp4" target="_blank"><img width="1282" height="882" alt="dlm-generation" src="https://github.com/user-attachments/assets/80e00290-9ff9-4678-b069-6d9679b702c4" /></a>
+
+
 ## Requirements
 
 - Python 3.10–3.12
