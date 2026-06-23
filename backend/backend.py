@@ -190,6 +190,20 @@ class GenerateRequest(BaseModel):
         default=False,
         description="If true, use prev_token_ids as the full prompt directly (skip chat template).",
     )
+    # ── incremental diffusion (one denoising step per request, stateless) ────
+    single_step: bool = Field(
+        default=False,
+        description="Diffusion only: run exactly ONE denoising step (the one at start_step) "
+                    "resuming from resume_gen_ids, instead of generating the whole trajectory.",
+    )
+    start_step: int = Field(
+        default=0, description="Global step index to compute when single_step is set."
+    )
+    resume_gen_ids: list[int] = Field(
+        default_factory=list,
+        description="Current generated portion (MASK_ID where unrevealed), carried by the "
+                    "client between single-step presses. Empty = first step (all masked).",
+    )
 
 
 # ── SSE helpers ─────────────────────────────────────────────────────────────
@@ -355,17 +369,36 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
         def _run_gen() -> None:
             gen_start = time.monotonic()
             try:
-                for sr in gen.generate_steps(
-                    prompt,
-                    gen_length=req.gen_length,
-                    steps=req.steps,
-                    block_length=req.block_length,
-                    temperature=req.temperature,
-                    cfg_scale=req.cfg_scale,
-                    remasking=req.remasking,
-                    return_attention=req.return_attention,
-                    echo_head_indices=req.echo_head_indices,
-                ):
+                # Incremental diffusion: run a single denoising step resuming from
+                # the client-carried sequence. Falls back to the full trajectory
+                # for the inference timescale and for non-diffusion models.
+                if req.single_step and isinstance(gen, LLaDAGenerator):
+                    step_iter = gen.generate_single_step(
+                        prompt,
+                        gen_ids=req.resume_gen_ids,
+                        global_step=req.start_step,
+                        gen_length=req.gen_length,
+                        steps=req.steps,
+                        block_length=req.block_length,
+                        temperature=req.temperature,
+                        cfg_scale=req.cfg_scale,
+                        remasking=req.remasking,
+                        return_attention=req.return_attention,
+                        echo_head_indices=req.echo_head_indices,
+                    )
+                else:
+                    step_iter = gen.generate_steps(
+                        prompt,
+                        gen_length=req.gen_length,
+                        steps=req.steps,
+                        block_length=req.block_length,
+                        temperature=req.temperature,
+                        cfg_scale=req.cfg_scale,
+                        remasking=req.remasking,
+                        return_attention=req.return_attention,
+                        echo_head_indices=req.echo_head_indices,
+                    )
+                for sr in step_iter:
                     if _cancel.is_set():
                         break   # stop between steps; current CUDA op finishes cleanly
                     sr.elapsed_s = time.monotonic() - gen_start

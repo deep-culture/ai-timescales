@@ -81,7 +81,7 @@
           <button
             class="btn diff" :disabled="busy || !online || !diffusionModel"
             @click="nextDiffStep"
-          >{{ diffStepBuffer.length ? 'Next denoising' : 'Denoise' }}</button>
+          >{{ diffStepIdx > 0 ? 'Next denoising' : 'Denoise' }}</button>
           <div class="status-buttons">
             <button class="btn status" v-if="genStatus[0] && genStatus[1]" :class="genStatus[0]" :title="genStatus[1]">
               <span v-if="genStatus[0] == 'processing'" class="spinner"></span>
@@ -555,11 +555,12 @@ const arLastAttnRow = ref<number[] | null>(null)
 // and steps again, we restart the sequence instead of continuing the old one.
 let arRunPrompt = ''
 
-// Diffusion attention mode state
-const diffStepBuffer = reactive<StepEvent[]>([])
-const diffStepIdx = ref(0)
+// Diffusion attention mode state (incremental: one denoising step per press,
+// stateless — the server recomputes each step from the carried sequence).
+const diffStepIdx = ref(0)                  // next global step to request (0-based)
+const diffGenIds = ref<number[]>([])        // current generated portion (MASK_ID where unrevealed), carried between presses
 const diffGenerationDone = ref(false)
-// Prompt the current denoising buffer was generated from (see arRunPrompt).
+// Prompt the current denoising run was started from (see arRunPrompt).
 let diffRunPrompt = ''
 const diffCurrentAttn = ref<number[][] | null>(null)
 
@@ -848,8 +849,8 @@ function switchTimescale(mode: 'inference' | 'attention') {
   arAttnIds.value = []
   arLastAttnRow.value = null
   arRunPrompt = ''
-  diffStepBuffer.length = 0
   diffStepIdx.value = 0
+  diffGenIds.value = []
   diffGenerationDone.value = false
   diffRunPrompt = ''
   diffCurrentAttn.value = null
@@ -1290,58 +1291,65 @@ async function nextARStep() {
   busy.value = false
 }
 
-// ── Diffusion attention mode
+// ── Diffusion attention mode (incremental, one step per press)
+// Each press runs a SINGLE denoising step on the server, resuming from the
+// generated portion we carry in `diffGenIds`. No buffering of the whole
+// trajectory — the server is stateless and recomputes each step from the
+// sequence we send back (LLaDA has no KV cache, so this costs the same as the
+// batch path but starts instantly and ships one step's data at a time).
 async function nextDiffStep() {
   if (busy.value || !online.value || !diffusionModel.value) return
 
   const msg = userInput.value.trim()
-  // Start a new generation when the buffer is exhausted/empty OR the prompt was
-  // edited since this buffer was generated — a changed prompt should denoise
-  // anew rather than continue stepping through the previous one.
+  const total = steps.value
+  // (Re)start a run on the first press, when the prompt was edited, or after the
+  // previous run completed — otherwise continue from where we left off.
   const promptChanged = msg !== '' && msg !== diffRunPrompt
-  if (diffStepIdx.value >= diffStepBuffer.length || promptChanged) {
+  const startNew = diffStepIdx.value === 0 || diffStepIdx.value >= total || promptChanged
+  if (startNew) {
     if (!msg) return
-    busy.value = true
-    genStatus.value = ['processing', 'Generating all steps…']
-    diffStepBuffer.length = 0
+    diffRunPrompt = msg
     diffStepIdx.value = 0
+    diffGenIds.value = []
     diffGenerationDone.value = false
     selectedTokenIdx.value = 0
     echoStep.value = null
-    diffRunPrompt = msg
-
-    const { steps: allSteps } = await fetchSteps({
-      model: diffusionModel.value,
-      messages: [{ role: 'user', content: msg }],
-      prev_token_ids: [],
-      gen_length: genLength.value,
-      steps: steps.value,
-      block_length: blockLength.value,
-      temperature: temperature.value,
-      tts: false,
-      return_attention: true,
-      // The per-layer echoes are head-reduced server-side, so the head
-      // selection active when a run starts is baked into every step's echo
-      // (empty = avg over all heads). Changing heads later re-blurs the live
-      // view instantly but, for the echoes, takes effect on the next run.
-      echo_head_indices: (headAvg.value || selectedHeads.size === 0) ? [] : [...selectedHeads],
-    })
-
-    for (const s of allSteps) diffStepBuffer.push(s)
-    diffGenerationDone.value = true
-
-    if (!diffStepBuffer.length) { busy.value = false; genStatus.value = ['warning', 'No steps']; return }
-  } else {
-    busy.value = true
   }
 
-  // Show the current step
-  const ev = diffStepBuffer[diffStepIdx.value]
-  diffStepIdx.value++
+  busy.value = true
+  const stepToRun = diffStepIdx.value
+  genStatus.value = ['processing', `Denoising step ${stepToRun + 1}/${total}…`]
+
+  const { steps: stepEvts } = await fetchSteps({
+    model: diffusionModel.value,
+    // Always send the run's original prompt (not the live input) so the server
+    // re-encodes an identical prompt every press — keeping the carried
+    // generated portion aligned to the same positions.
+    messages: [{ role: 'user', content: diffRunPrompt }],
+    prev_token_ids: [],
+    gen_length: genLength.value,
+    steps: total,
+    block_length: blockLength.value,
+    temperature: temperature.value,
+    tts: false,
+    return_attention: true,
+    single_step: true,
+    start_step: stepToRun,
+    resume_gen_ids: diffGenIds.value,
+    // Per-press head selection: changing heads between presses now takes effect
+    // on the next step's echoes (each step is its own request).
+    echo_head_indices: (headAvg.value || selectedHeads.size === 0) ? [] : [...selectedHeads],
+  })
+
+  if (!stepEvts.length) { busy.value = false; genStatus.value = ['warning', 'No step']; return }
+  const ev = stepEvts[0]
+  diffGenIds.value = ev.token_ids          // carry the sequence forward for the next press
+  diffStepIdx.value = stepToRun + 1
+  diffGenerationDone.value = diffStepIdx.value >= total
   diffCurrentAttn.value = (ev.attention as number[][] | undefined) ?? null
   lastStep.value = ev
-  // Echoes replay the step the user is looking at — every step now carries its
-  // own per-layer attention, so point the echo at this step (not the final one).
+  // Echoes replay the step the user is looking at — every step carries its own
+  // per-layer attention, so point the echo at this step.
   if (ev.layers) echoStep.value = ev
 
   // Render diffusion tokens + update blur
@@ -1352,7 +1360,7 @@ async function nextDiffStep() {
   // TTS: play selected token first, then all others with attention-mapped volume
   await playDiffusionAttentionTTS(ev)
 
-  genStatus.value = ['done', `step ${diffStepIdx.value}/${diffStepBuffer.length}`]
+  genStatus.value = ['done', `step ${diffStepIdx.value}/${total}`]
   busy.value = false
 }
 
@@ -1886,6 +1894,7 @@ input[type=number] {
    muted relative to the response so the generated text still reads clearly. */
 .tok-prompt, .tok-special {
   background-color: var(--color-secondary);
+  cursor: auto;
 }
 
 /* Special / chat-template tokens (e.g. <|start_header_id|>) — shown because the
