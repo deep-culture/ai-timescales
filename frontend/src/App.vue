@@ -551,11 +551,16 @@ let arPromptTokens: string[] = []
 let arPromptSpecials: boolean[] = []
 const arAttnIds = ref<number[]>([])           // full token IDs for continue_only
 const arLastAttnRow = ref<number[] | null>(null)
+// Prompt the current AR sequence was started from. If the user edits the prompt
+// and steps again, we restart the sequence instead of continuing the old one.
+let arRunPrompt = ''
 
 // Diffusion attention mode state
 const diffStepBuffer = reactive<StepEvent[]>([])
 const diffStepIdx = ref(0)
 const diffGenerationDone = ref(false)
+// Prompt the current denoising buffer was generated from (see arRunPrompt).
+let diffRunPrompt = ''
 const diffCurrentAttn = ref<number[][] | null>(null)
 
 const constraintNote = computed(() => {
@@ -842,9 +847,11 @@ function switchTimescale(mode: 'inference' | 'attention') {
   arPromptSpecials = []
   arAttnIds.value = []
   arLastAttnRow.value = null
+  arRunPrompt = ''
   diffStepBuffer.length = 0
   diffStepIdx.value = 0
   diffGenerationDone.value = false
+  diffRunPrompt = ''
   diffCurrentAttn.value = null
   selectedTokenIdx.value = 0
   tokenBlurs.length = 0
@@ -1183,7 +1190,20 @@ async function nextARStep() {
   busy.value = true
   genStatus.value = ['processing', 'Next AR token…']
 
-  const isFirst = arAttnIds.value.length === 0
+  // Begin a fresh sequence on the first step OR whenever the prompt was edited
+  // since this run started — a changed prompt should autoregress anew rather
+  // than continue the previous one.
+  const isFirst = arAttnIds.value.length === 0 || (msg !== '' && msg !== arRunPrompt)
+  if (isFirst) {
+    arAttnIds.value = []
+    arAttnTokens.length = 0
+    arAttnSpecials.length = 0
+    arPromptTokens = []
+    arPromptSpecials = []
+    arLastAttnRow.value = null
+    echoStep.value = null
+    arRunPrompt = msg
+  }
   const { steps: stepEvts, finalIds } = await fetchSteps({
     model: arModel.value,
     messages: isFirst ? [{ role: 'user', content: msg }] : [],
@@ -1274,9 +1294,12 @@ async function nextARStep() {
 async function nextDiffStep() {
   if (busy.value || !online.value || !diffusionModel.value) return
 
-  // If buffer is exhausted or empty, start a new generation
-  if (diffStepIdx.value >= diffStepBuffer.length) {
-    const msg = userInput.value.trim()
+  const msg = userInput.value.trim()
+  // Start a new generation when the buffer is exhausted/empty OR the prompt was
+  // edited since this buffer was generated — a changed prompt should denoise
+  // anew rather than continue stepping through the previous one.
+  const promptChanged = msg !== '' && msg !== diffRunPrompt
+  if (diffStepIdx.value >= diffStepBuffer.length || promptChanged) {
     if (!msg) return
     busy.value = true
     genStatus.value = ['processing', 'Generating all steps…']
@@ -1284,6 +1307,8 @@ async function nextDiffStep() {
     diffStepIdx.value = 0
     diffGenerationDone.value = false
     selectedTokenIdx.value = 0
+    echoStep.value = null
+    diffRunPrompt = msg
 
     const { steps: allSteps } = await fetchSteps({
       model: diffusionModel.value,
