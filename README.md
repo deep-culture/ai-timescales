@@ -13,7 +13,7 @@ AI Timescales lets you listen to the timescales of inference and attention of tw
 
 - Python 3.10–3.12
 - Node.js 18+ and npm
-- A HuggingFace token with access to [LLaMA 3.1 9B](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) for best comparison with the diffusion model (LLaDa 8B-Instruct), or another AR-LM of your choosing.
+- A HuggingFace token with access to [LLaMA 3.1 8B](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) for best comparison with the diffusion model (LLaDa 8B-Instruct), or another AR-LM of your choosing.
 
 ---
 
