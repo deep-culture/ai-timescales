@@ -187,6 +187,7 @@ class LlamaGenerator(BaseGenerator):
 
         input_ids = prompt_ids.to(self.device)
         generated: list[int] = []
+        confs: list[float] = []   # one probability per generated token (see below)
         eos_id = self.tokenizer.eos_token_id
 
         capture_hooks = self._register_capture_hooks() if return_attention else []
@@ -203,6 +204,11 @@ class LlamaGenerator(BaseGenerator):
                 else:
                     probs = F.softmax(next_token_logits / temperature, dim=-1)
                     next_token_id = int(torch.multinomial(probs, num_samples=1).item())
+
+                # Per-token confidence, read from the raw logits
+                confs.append(
+                    float(F.softmax(next_token_logits.float(), dim=-1)[0, next_token_id])
+                )
 
                 generated.append(next_token_id)
                 input_ids = torch.cat(
@@ -255,6 +261,7 @@ class LlamaGenerator(BaseGenerator):
                     step_index=step,
                     token_ids=list(generated),
                     decoded_tokens=decoded,
+                    confidences=list(confs),
                     attention=attn,
                     mask_positions=[],
                     newly_revealed=[len(generated) - 1],

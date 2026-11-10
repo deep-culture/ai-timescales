@@ -28,7 +28,8 @@
         <label>Sequence length <input type="number" v-model.number="genLength" min="8" max="256" step="8" @change="snapConstraints()" /></label>
       </span>
       <span class="input">
-        <label>Temperature <input type="number" v-model.number="temperature" min="0" max="2" step="0.1" /></label>
+        <label>Temperature <input type="number" v-model.number="temperature" min="0" max="2" step="0.1" disabled
+          title="Fixed at 0 - greedy decoding keeps the AR-LM and the DLM comparable and every run reproducible." /></label>
       </span>
     </div>
     <div class="control-box diffusion-params" v-if="diffusionModel">
@@ -167,6 +168,10 @@
 
       <!-- single merged output box -->
       <div class="output" ref="outputEl">
+        <div v-if="timescale === 'inference'" class="inference-notice">
+          <p>Text-to-speech may create latency. Run the same prompt a second time to hear the correct timings.</p>
+          <p>Opacity indicates token confidence (argmax).</p>
+        </div>
         <span v-for="(tok, i) in tokens" :key="i"
           :class="['tok', tok.cls, isSelectedToken(i) ? 'tok-selected' : '']"
           @click="onTokenClick(i)"
@@ -327,7 +332,7 @@ const lastStepJson = computed(() => lastStep.value ? JSON.stringify(lastStep.val
 // params
 const genLength = ref(64)
 const steps = ref(32)
-const temperature = ref(0.2)
+const temperature = ref(0)   // pinned - see the disabled input in the template
 const blockLength = ref(64)
 const ttsEnabled = ref(true)
 const ttsVolume = ref(1)
@@ -951,6 +956,7 @@ function switchTimescale(mode: 'inference' | 'attention') {
   diffCurrentAttn.value = null
   selectedTokenIdx.value = 0
   tokenBlurs.length = 0
+  tokenOpacity.length = 0
   headAvg.value = true
   selectedHeads.clear()
   echoStep.value = null
@@ -1511,11 +1517,12 @@ function onTokenClick(i: number) {
 function renderAR(ev: StepEvent) {
   const revSet = new Set(ev.newly_revealed)
   tokens.length = 0
-  // An AR step predicts one position, not all of them, so there is no
-  // per-token confidence to show.
   tokenOpacity.length = 0
   pushPromptTokens(ev)   // attention timescale only (no-op otherwise)
+  // Prompt tokens are given context, not predictions - always fully opaque.
+  for (let i = 0; i < (ev.prompt_tokens?.length ?? 0); i++) tokenOpacity.push(1)
   for (let i = 0; i < ev.decoded_tokens.length; i++) {
+    tokenOpacity.push(confidenceOpacity(ev.confidences?.[i]))
     tokens.push({ text: ev.decoded_tokens[i] || '\u00a0', cls: responseClass(ev, i, revSet.has(i)) })
   }
 }
@@ -1775,6 +1782,12 @@ input {
   text-align: center;
 }
 
+input:disabled {
+  color: var(--color-primary);
+  opacity: 1;
+  cursor: not-allowed;
+}
+
 .prompt-input {
   width: 100%;
   height: 5rem;
@@ -1811,6 +1824,13 @@ button:not(:disabled):hover {
 
 #output-box {
   margin-top: 1rem;
+}
+
+#output-box .inference-notice {
+  color: var(--color-primary);
+  font-size: .8rem;
+  line-height: 1;
+  margin-bottom: .4rem;
 }
 
 .output {
@@ -2007,11 +2027,6 @@ input[type=number] {
   outline-offset: -1px;
 }
 
-/* Prompt context tokens, and the special / chat-template markers that share
-   their styling: <|endoftext|>, <|eot_id|>, <|start_header_id|>, <|mdm_mask|>
-   and friends. All are present and attended over, but muted relative to the
-   response so the generated text still reads clearly. Specials keep their own
-   class so they can be targeted separately — they just inherit this look. */
 .tok-prompt, .tok-special {
   background-color: var(--color-secondary);
   cursor: auto;
