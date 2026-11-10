@@ -108,7 +108,7 @@
         >{{ h - 1 }}</button>
         </div>
     </div>
-    <!-- layer echo playback — plays all attention layers first→last -->
+    <!-- layer echo playback plays all attention layers first to last -->
     <div v-if="timescale === 'attention'" class="control-box echo-row last-controls">
       <div><h2>Attention echoes</h2></div>
       <div class="btn-row">
@@ -159,8 +159,7 @@
         />
         <div class="attn-graph-caption">
           <strong>Y = <a href="https://transformer-circuits.pub/2021/framework/index.html" target="_blank">Direct Logit Attribution</a></strong> (how much each attention layer
-          pushes the final output toward the chosen token. The dashed line is zero:
-          above it the layer promotes the token, below it the layer suppresses it).<br>
+          pushes the final output toward the chosen token.).<br>
           <strong>X = Moment when each layer is reached</strong> (measured by CUDA events).<br>
           <strong>Dot = Currently playing.</strong>
         </div>
@@ -196,9 +195,8 @@
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import HeartbeatGraph from './components/HeartbeatGraph.vue'
 
-// ── types
-// Per-layer "attention echoes" — carried by every step now (replayed for the
-// step currently in view, not just the final one).
+// types
+// Per-layer "attention echoes"
 interface LayerData {
   n_layers: number
   n_heads: number
@@ -218,6 +216,7 @@ interface StepEvent {
   decoded_tokens: string[]
   mask_positions: number[]
   newly_revealed: number[]
+  diffusion?: boolean             // model type, from the backend (never inferred)
   attention?: number[] | number[][]          // mean: 1D (AR) or 2D (diffusion)
   attention_heads?: number[][] | number[][][] // per-head: (n_heads,T) or (n_heads,gen,T)
   n_heads?: number
@@ -230,7 +229,7 @@ interface StepEvent {
 
 interface HeartbeatPoint { x: number; y: number }
 
-// ── auth
+// auth
 const loginRequired = ref(false)
 const loggedIn = ref(false)
 const authToken = ref<string | null>(sessionStorage.getItem('auth_token'))
@@ -269,7 +268,7 @@ async function doLogin() {
   }
 }
 
-// ── state
+// state
 const online = ref(false)
 const busy = ref(false)
 const statusText = ref('Connecting…')
@@ -284,11 +283,11 @@ const heartbeat = reactive<HeartbeatPoint[]>([])
 const stepTimes = reactive<number[]>([])
 let t0 = 0
 
-// ── model badge
+// model badge
 const _tokensPerSecHistory = reactive<number[]>([])
 let _lastStepTime = 0
 const _currentRunModel = ref<string | null>(null)
-const _currentRunType = ref<'AR' | 'diffusion' | null>(null)
+const _currentRunType = ref<'AR-LM' | 'DLM' | null>(null)
 
 const graphTitle = computed(() => {
   const m = _currentRunModel.value
@@ -301,7 +300,7 @@ const graphTitle = computed(() => {
   return avg ? `${short} · ~${avg} tokens per second` : `${short}`
 })
 
-function resetRunMetrics(model: string, type: 'AR' | 'diffusion') {
+function resetRunMetrics(model: string, type: 'AR-LM' | 'DLM') {
   _currentRunModel.value = model
   _currentRunType.value = type
   _tokensPerSecHistory.length = 0
@@ -330,20 +329,20 @@ const blockLength = ref(32)
 const ttsEnabled = ref(true)
 const ttsVolume = ref(1)
 
-// ── timescale mode
+// timescale mode
 const timescale = ref<'inference' | 'attention'>('inference')
 const selectedTokenIdx = ref(0)
 
-// ── head selection (multi-select)
+// head selection (multi-select)
 const headAvg = ref(true)
 const selectedHeads = reactive(new Set<number>())
 const nHeads = ref(32)
 const availableVoices = ref<string[]>(['af_heart'])
 const tokenBlurs = reactive<number[]>([])
 
-// ── layer "echo" playback
+// layer "echo" playback
 // Layer data from the final step of the last sequence (carries every layer's
-// attention + per-layer timings). One voice per layer, played first→last.
+// attention + per-layer timings). One voice per token, played first→last.
 const echoStep = ref<StepEvent | null>(null)
 // 'eigenzeit' → schedule each layer at its real (sub-ms) inter-layer delay;
 // 'interval'  → insert a 2-second gap between layers so it's audible.
@@ -358,9 +357,16 @@ let _echoTimers: number[] = []         // pending blur-update timers, cleared on
 // Fixed voice palette: index 0 = avg voice, indices 1-4 = head voices (cycling)
 const DEFAULT_VOICES = ['af_heart', 'af_nicole', 'am_michael', 'bf_alice', 'bm_fable']
 
-// ── derived state
+// derived state
+
+// Is this step from a diffusion model?
+function isDiffusionStep(ev: StepEvent | null | undefined): boolean {
+  if (!ev) return false
+  return ev.diffusion ?? ((ev.mask_positions?.length ?? 0) > 0)
+}
+
 const isDiffAttnMode = computed(() =>
-  timescale.value === 'attention' && (lastStep.value?.mask_positions?.length ?? 0) > 0
+  timescale.value === 'attention' && isDiffusionStep(lastStep.value)
 )
 
 function isSelectedToken(i: number): boolean {
@@ -407,9 +413,9 @@ function _recomputeAfterHeadChange() {
   }
 }
 
-// ── effective attention row (averaged over selection, used for blur) ──────
+// effective attention row (averaged over selection, used for blur)
 function getEffectiveAttnRow(ev: StepEvent, rowIdx?: number): number[] {
-  const isDiff = (ev.mask_positions?.length ?? 0) > 0
+  const isDiff = isDiffusionStep(ev)
   const useMean = headAvg.value || selectedHeads.size === 0
 
   if (useMean || !ev.attention_heads) {
@@ -435,14 +441,7 @@ function getEffectiveAttnRow(ev: StepEvent, rowIdx?: number): number[] {
 
 const MAX_BLUR = 8
 
-// ── full-sequence attention display model
-// In the attention timescale the displayed token stream is the WHOLE sequence
-// the model attends over: prompt + chat-template/special tokens, then the
-// response. The invariant that keeps the bookkeeping sane:
-//     display index  ==  sequence position  ==  attention key (column) index.
-// Prompt tokens are shown and blur with attention, but are never the query
-// (AR query = last token; DLM query = a clicked response token) and never
-// drive TTS if they are special/template tokens.
+// full-sequence attention display model
 
 // Number of prompt (incl. template) tokens carried by an attention step/echo.
 // Zero outside the attention timescale (the backend only sends them there).
@@ -572,9 +571,9 @@ const constraintNote = computed(() => {
   return `blocks=${nb}, steps/block=${spb}`
 })
 
-// ── heartbeat SVG path (reactive)
+// heartbeat SVG path (reactive)
 
-// ── snap constraints
+// snap constraints
 function snapConstraints() {
   let gl = Math.max(8, genLength.value)
   let bl = Math.max(8, blockLength.value)
@@ -593,7 +592,7 @@ function snapConstraints() {
   }
 }
 
-// ── backend polling
+// backend polling
 let pollTimer: number | undefined
 
 async function checkServer() {
@@ -716,11 +715,21 @@ async function streamGenerate(
   }
 }
 
-// ── TTS + display queue (Option C: step buffering)
+// TTS + display queue (Option C: step buffering)
 // Generation runs freely; TTS fetches fire in parallel; display waits per-step
 // until its audio is ready, then plays + renders simultaneously.
 
-const SKIP_TOKENS = new Set(['<|endoftext|>', '<|eot_id|>', '<|start_header_id|>', '<|end_header_id|>', '<eos>', '<s>', '</s>', '<pad>'])
+const SKIP_TOKENS = new Set(
+    [
+      '<|endoftext|>',
+      '<|eot_id|>',
+      '<|start_header_id|>',
+      '<|end_header_id|>',
+      '<eos>',
+      '<s>',
+      '</s>',
+      '<pad>'
+    ])
 
 let _audioCtx: AudioContext | null = null
 function getAudioCtx(): AudioContext {
@@ -738,7 +747,7 @@ function getAudioCtx(): AudioContext {
 // denoising steps, and replays. The echo playback in particular asks for the
 // same (text, voice) on all 32 layers — without this it re-fetched and
 // re-decoded each one; with it, every token is fetched + decoded at most once.
-// Storing the in-flight Promise also dedups concurrent requests for the same
+// Storing the in-flight Promise also deduplicates concurrent requests for the same
 // token (e.g. the 32 layers firing together).
 const _ttsBufferCache = new Map<string, Promise<AudioBuffer | null>>()
 
@@ -900,7 +909,7 @@ function panForIndex(i: number, total: number): number {
   return (t * 2) - 1
 }
 
-// ── volume-aware TTS playback
+// volume-aware TTS playback
 async function fetchTtsBuffersWithVolumes(
   tokenTexts: string[],
   pans: number[],
@@ -938,7 +947,7 @@ function playAudioBuffersWithVolumes(items: { buffer: AudioBuffer; pan: number; 
   return maxDuration
 }
 
-// ── layer "echo" playback
+// layer "echo" playback
 // Plays the per-layer attention scores layer-by-layer (first→last). Each layer
 // gets its own TTS voice; a token's amplitude scales with its attention score
 // (loud = attended, whisper = ignored).
@@ -1093,7 +1102,7 @@ const attnGraphLabel = computed(() => {
   const m = _currentRunModel.value
   if (!m) return ''
   const short = m.split('/').pop() ?? m
-  if (_currentRunType.value === 'diffusion') {
+  if (_currentRunType.value === 'DLM') {
     return `${short} · denoising step ${diffStepIdx.value}`
   }
   return `${short} · token ${arAttnTokens.length}`
@@ -1171,7 +1180,7 @@ async function playLayerEchoes() {
   }
 }
 
-// ── single-step fetch helper
+// single-step fetch helper
 async function fetchSteps(body: Record<string, unknown>): Promise<{ steps: StepEvent[]; finalIds: number[]; finalText: string }> {
   const res = await fetch('/api/generate', {
     method: 'POST',
@@ -1206,7 +1215,7 @@ async function fetchSteps(body: Record<string, unknown>): Promise<{ steps: StepE
   return { steps: collectedSteps, finalIds, finalText }
 }
 
-// ── AR attention mode
+// AR attention mode
 async function nextARStep() {
   if (busy.value || !online.value || !arModel.value) return
   const msg = userInput.value.trim()
@@ -1215,7 +1224,7 @@ async function nextARStep() {
   genStatus.value = ['processing', 'Next AR token…']
   // Drive the attention-graph badge (model + token count).
   _currentRunModel.value = arModel.value
-  _currentRunType.value = 'AR'
+  _currentRunType.value = 'AR-LM'
 
   // Begin a fresh sequence on the first step OR whenever the prompt was edited
   // since this run started — a changed prompt should autoregress anew rather
@@ -1317,17 +1326,12 @@ async function nextARStep() {
   busy.value = false
 }
 
-// ── Diffusion attention mode (incremental, one step per press)
-// Each press runs a SINGLE denoising step on the server, resuming from the
-// generated portion we carry in `diffGenIds`. No buffering of the whole
-// trajectory — the server is stateless and recomputes each step from the
-// sequence we send back (LLaDA has no KV cache, so this costs the same as the
-// batch path but starts instantly and ships one step's data at a time).
+// Diffusion attention mode (incremental, one step per press)
 async function nextDiffStep() {
   if (busy.value || !online.value || !diffusionModel.value) return
   // Drive the attention-graph badge (model + denoising-step count).
   _currentRunModel.value = diffusionModel.value
-  _currentRunType.value = 'diffusion'
+  _currentRunType.value = 'DLM'
 
   const msg = userInput.value.trim()
   const total = steps.value
@@ -1435,7 +1439,7 @@ async function playDiffusionAttentionTTS(ev: StepEvent) {
   playAudioBuffersWithVolumes(bufs)
 }
 
-// ── token click handler
+// token click handler
 function onTokenClick(i: number) {
   // Only interactive for diffusion attention mode
   if (!isDiffAttnMode.value) return
@@ -1448,7 +1452,7 @@ function onTokenClick(i: number) {
   }
 }
 
-// ── token rendering helpers
+// token rendering helpers
 function renderAR(ev: StepEvent) {
   const revSet = new Set(ev.newly_revealed)
   tokens.length = 0
@@ -1464,8 +1468,8 @@ function renderDiffusion(ev: StepEvent) {
   tokens.length = 0
   pushPromptTokens(ev)   // attention timescale only (no-op otherwise)
   for (let i = 0; i < ev.decoded_tokens.length; i++) {
-    if (maskSet.has(i)) tokens.push({ text: '▒', cls: 'tok-mask' })
-    else tokens.push({ text: ev.decoded_tokens[i] || '\u00a0', cls: responseClass(ev, i, revSet.has(i)) })
+    //if (maskSet.has(i)) tokens.push({ text: '▒', cls: 'tok-mask' })
+    tokens.push({ text: ev.decoded_tokens[i] || '\u00a0', cls: responseClass(ev, i, revSet.has(i)) })
   }
 }
 
@@ -1478,7 +1482,7 @@ function pushHeartbeat(ev: StepEvent) {
   lastStep.value = ev
 }
 
-// ── actions
+// actions
 const outputEl = ref<HTMLElement | null>(null)
 
 function scrollOutput() {
@@ -1496,7 +1500,7 @@ async function runAR() {
   lastStep.value = null
   t0 = performance.now()
   resetDisplayQueue()
-  resetRunMetrics(arModel.value, 'AR')
+  resetRunMetrics(arModel.value, 'AR-LM')
   // Never retain context between inference-mode runs — avoids growing GPU allocations
   prevIds.ar = []
 
@@ -1519,7 +1523,7 @@ async function runDiffuse() {
   lastStep.value = null
   t0 = performance.now()
   resetDisplayQueue()
-  resetRunMetrics(diffusionModel.value, 'diffusion')
+  resetRunMetrics(diffusionModel.value, 'DLM')
   // Never retain context between inference-mode runs — avoids growing GPU allocations
   prevIds.diffusion = []
 
@@ -1544,7 +1548,7 @@ async function runBoth() {
 
   if (arModel.value) {
     genStatus.value = ['processing', `${arModel.value}…`]
-    resetRunMetrics(arModel.value, 'AR')
+    resetRunMetrics(arModel.value, 'AR-LM')
     const { ok } = await streamGenerate(arModel.value, msg, [], (ev) => {
       enqueueStep(ev, renderAR)
     })
@@ -1561,7 +1565,7 @@ async function runBoth() {
 
   if (diffusionModel.value) {
     genStatus.value = ['processing', `${diffusionModel.value}…`]
-    resetRunMetrics(diffusionModel.value, 'diffusion')
+    resetRunMetrics(diffusionModel.value, 'DLM')
     const { ok } = await streamGenerate(diffusionModel.value, msg, [], (ev) => {
       enqueueStep(ev, renderDiffusion)
     })

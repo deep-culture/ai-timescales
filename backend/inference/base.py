@@ -8,9 +8,32 @@ from typing import Iterator, List, Optional
 import torch
 
 
+_TIMING_FALLBACKS_SEEN: set[str] = set()
+
+
+def _warn_timing_fallback(reason: str, device: Optional["torch.device"]) -> None:
+    """Print once per distinct reason that per-layer timings are CPU-sourced.
+
+    A CPU timestamp records when the *host* enqueued a layer, not when the GPU
+    executed it. That is a different quantity from the Eigenzeit the attention
+    timescale plays back, so it must never pass for it silently.
+    """
+    key = f"{reason}|{device}"
+    if key in _TIMING_FALLBACKS_SEEN:
+        return
+    _TIMING_FALLBACKS_SEEN.add(key)
+    print(
+        f"[timing] per-layer Eigenzeit falling back to the CPU clock on "
+        f"{device or 'unknown device'}: {reason}. These are kernel-launch "
+        f"offsets, not GPU execution times.",
+        flush=True,
+    )
+
+
 def gpu_event_offsets_ns(
     events: List[Optional["torch.cuda.Event"]],
     fallback_ns: List[int],
+    device: Optional["torch.device"] = None,
 ) -> List[int]:
     """Per-layer Eigenzeit as *when the GPU actually executed* each layer.
 
@@ -26,13 +49,21 @@ def gpu_event_offsets_ns(
     """
     if torch.cuda.is_available() and events and all(e is not None for e in events):
         try:
-            torch.cuda.synchronize()
+            # Wait on the LAST event rather than on a device
+            events[-1].synchronize()
             t0 = events[0]
             # elapsed_time is GPU-measured milliseconds → nanoseconds.
             return [int(round(t0.elapsed_time(e) * 1e6)) for e in events]
-        except (RuntimeError, ValueError):
-            pass  # event not recorded / cross-device — fall through to CPU times
-    return list(fallback_ns)
+        except (RuntimeError, ValueError) as exc:
+            # Never recorded, or recorded on different devices (a sharded model
+            # has no common clock) — fall through to the CPU clock, but say so.
+            _warn_timing_fallback(f"{type(exc).__name__}: {exc}", device)
+    elif torch.cuda.is_available():
+        _warn_timing_fallback("no CUDA timing events were available", device)
+    # CPU fallback: return true offsets relative to the first layer so the wire
+    # format matches the CUDA path (layer 0 = 0). A 0 means "never stamped".
+    base = fallback_ns[0] if fallback_ns else 0
+    return [int(x - base) if x else 0 for x in fallback_ns]
 
 
 def rms_logit_attribution(
@@ -103,7 +134,9 @@ class BaseGenerator(abc.ABC):
 
     name: str = "base"
 
-    # ── lifecycle ────────────────────────────────────────────────────────
+    is_diffusion: bool = False
+
+    # lifecycle
     @abc.abstractmethod
     def load(self) -> None:
         """Load model + tokenizer onto the target device."""
@@ -112,7 +145,7 @@ class BaseGenerator(abc.ABC):
     def is_loaded(self) -> bool:
         ...
 
-    # ── tokenisation helpers ─────────────────────────────────────────────
+    # tokenisation helpers
     @abc.abstractmethod
     def encode_chat(self, messages: list[dict]) -> torch.Tensor:
         """Apply chat template + tokenise → (1, L) tensor on device."""
@@ -121,7 +154,7 @@ class BaseGenerator(abc.ABC):
     def decode_ids(self, ids: list[int], skip_special: bool = False) -> str:
         """Decode a list of token IDs to a string."""
 
-    # ── generation ───────────────────────────────────────────────────────
+    # generation
     @abc.abstractmethod
     def generate_steps(
         self,

@@ -41,6 +41,7 @@ def _get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tens
 
 class LLaDAGenerator(BaseGenerator):
     name = "LLaDA-8B-Instruct"
+    is_diffusion = True
 
     def __init__(
         self,
@@ -187,7 +188,7 @@ class LLaDAGenerator(BaseGenerator):
         # back to self.device so all subsequent ops are on the same device as x.
         logits = logits.to(self.device)
 
-        # ── attention capture ────────────────────────────────────────────
+        # Attention capture
         # Every block stores its weights each forward (patch_model). We capture
         # the full per-layer "echo" on EVERY step so the echo playback can
         # replay the step the user is looking at. To keep that affordable, the

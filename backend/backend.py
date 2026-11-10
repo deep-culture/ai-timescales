@@ -23,7 +23,7 @@ load_dotenv(ROOT / ".env")
 if not os.environ.get("HF_HOME"):
     os.environ["HF_HOME"] = str(HERE / "huggingface")
 
-# ── FastAPI imports first, before anything that uses them ─────────────────
+# FastAPI imports first, before anything that uses them
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -36,7 +36,7 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
-# ── auth ─────────────────────────────────────────────────────────────────────
+# auth
 _LOGIN_USER = os.environ.get("LOGIN_USER", "").strip()
 _LOGIN_PASSWORD = os.environ.get("LOGIN_PASSWORD", "").strip()
 AUTH_REQUIRED = bool(_LOGIN_USER and _LOGIN_PASSWORD)
@@ -62,13 +62,13 @@ from inference import LLaDAGenerator, LlamaGenerator
 from inference.base import BaseGenerator
 from inference.llada import EOS_ID, MASK_ID
 
-# ── global cancellation flag (one generation at a time) ──────────────────
+# global cancellation flag (one generation at a time)
 _cancel = threading.Event()
 
-# ── model registry (populated in lifespan) ───────────────────────────────
+# model registry (populated in lifespan)
 _GENERATORS: dict[str, BaseGenerator] = {}
 
-# ── TTS pipeline (Kokoro, loaded in lifespan) ────────────────────────────
+# TTS pipeline (Kokoro, loaded in lifespan)
 _tts_pipeline = None
 _tts_lock = threading.Lock()
 _tts_cache: dict[tuple, bytes] = {}   # (text, speed, voice) → WAV bytes
@@ -165,7 +165,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── request schema ─────────────────────────────────────────────────────────
+# request schema
 class GenerateRequest(BaseModel):
     model: str = "LLaDA-8B-Instruct"
     messages: list[dict] = Field(default_factory=list)
@@ -190,7 +190,7 @@ class GenerateRequest(BaseModel):
         default=False,
         description="If true, use prev_token_ids as the full prompt directly (skip chat template).",
     )
-    # ── incremental diffusion (one denoising step per request, stateless) ────
+    # incremental diffusion (one denoising step per request, stateless) ────
     single_step: bool = Field(
         default=False,
         description="Diffusion only: run exactly ONE denoising step (the one at start_step) "
@@ -206,13 +206,13 @@ class GenerateRequest(BaseModel):
     )
 
 
-# ── SSE helpers ─────────────────────────────────────────────────────────────
+# SSE helpers
 def _sse(event: str, data: dict) -> str:
     """Format a single SSE message (event + data + blank-line delimiter)."""
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-# ── auth endpoints (public) ──────────────────────────────────────────────────
+# auth endpoints (public)
 @app.get("/auth-config")
 async def auth_config() -> dict:
     return {"required": AUTH_REQUIRED}
@@ -246,7 +246,7 @@ async def logout(
     return {"status": "ok"}
 
 
-# ── endpoints ───────────────────────────────────────────────────────────────
+# endpoints
 @app.get("/status")
 async def server_status(_: None = Depends(require_auth)) -> dict:
     """Richer status: includes which models are loaded and ready."""
@@ -267,7 +267,7 @@ async def stop_generation(_: None = Depends(require_auth)) -> dict:
     return {"status": "stopping"}
 
 
-# ── TTS schema + helpers ────────────────────────────────────────────────────
+# TTS schema + helpers
 class TTSRequest(BaseModel):
     text: str
     speed: float = 1.2
@@ -325,7 +325,7 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
     gen = _GENERATORS[req.model]
     _cancel.clear()  # reset flag for this new generation
 
-    # ── build the prompt tensor server-side ────────────────────────────────
+    # build the prompt tensor server-side
     if req.continue_only and req.prev_token_ids:
         # Attention mode: continue directly from accumulated token IDs
         prompt = torch.tensor([req.prev_token_ids], device=gen.device)
@@ -350,19 +350,16 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
     _prompt_tokens = [gen.decode_ids([t]) for t in _prompt_id_list]
     _prompt_specials = [bool(t in _special_ids) for t in _prompt_id_list]
 
-    # Drop the leading BOS "attention sink" from the *exposed* sequence. Llama's
-    # <|begin_of_text|> (sometimes doubled) soaks up most attention in every head
-    # and layer, so it never blurs and dominates the blur/TTS normalisation. We
-    # trim it from the prompt labels and slice the same number of leading key
-    # columns off every attention row below (the model still ingests it — this
-    # only affects what the frontend renders/sonifies). LLaDA uses a different
-    # start token (<|startoftext|>), so it is left untouched.
+    # Drop the leading BOS "attention sink" from the *exposed* sequence.
     _SINK_TOKEN = "<|begin_of_text|>"
     _n_sink = 0
     while _n_sink < len(_prompt_tokens) and _prompt_tokens[_n_sink] == _SINK_TOKEN:
         _n_sink += 1
     _prompt_tokens = _prompt_tokens[_n_sink:]
     _prompt_specials = _prompt_specials[_n_sink:]
+
+    # Does this model denoise a whole sequence, or decode left to right?
+    is_diffusion = bool(getattr(gen, "is_diffusion", False))
 
     async def event_stream() -> AsyncGenerator[str, None]:
         loop = asyncio.get_running_loop()
@@ -433,8 +430,9 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                 "decoded_tokens": item.decoded_tokens,
                 "mask_positions": item.mask_positions,
                 "newly_revealed": item.newly_revealed,
+                "diffusion":      is_diffusion,
             }
-            # ── synthesize TTS for newly-revealed tokens (parallel) ───────────
+            # synthesize TTS for newly-revealed tokens (parallel)
             if req.tts and item.newly_revealed:
                 tok_texts = [
                     item.decoded_tokens[i]
@@ -452,7 +450,7 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                         _base64mod.b64encode(w).decode("ascii") if w else ""
                         for w in wavs
                     ]
-            # ── include attention if requested ────────────────────────────
+            # include attention if requested
             if req.return_attention and item.attention is not None:
                 attn = item.attention
                 # Normalize to (n_heads, T, T)
@@ -465,7 +463,7 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                 ks = _n_sink                # leading sink (BOS) key columns to drop
                 step_data["prompt_length"] = pl - ks
                 step_data["n_heads"] = n_heads
-                if not item.mask_positions:
+                if not is_diffusion:
                     # AR: last row per head → (n_heads, T); also send mean for compat
                     step_data["attention"] = mean_attn[-1, ks:].float().tolist()
                     step_data["attention_heads"] = attn[:, -1, ks:].float().tolist()
@@ -475,12 +473,11 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                     step_data["attention"] = mean_attn[pl:, ks:].float().tolist()
                     step_data["attention_heads"] = attn[:, pl:, ks:].float().tolist()
 
-            # ── second timescale: per-layer "attention echoes" (every step) ──
+            # second timescale: per-layer "attention echoes" (every step)
             # One self-contained object carrying every layer's attention plus
             # the per-layer timings, so the frontend can replay layer-by-layer
             # for whichever step is currently in view.
             if req.return_attention and item.attention_layers is not None:
-                is_diffusion = isinstance(gen, LLaDAGenerator)
                 al = item.attention_layers
                 ks = _n_sink                # leading sink (BOS) key columns to drop
                 if is_diffusion:
@@ -515,11 +512,7 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                     layers_obj["dla"] = item.attention_dla.tolist()
                 step_data["layers"] = layers_obj
 
-            # ── full-sequence token labels for the attention timescale ────────
-            # Prompt + special tokens (shown but not focusable) and a per-token
-            # "is special" mask for both prompt and generated tokens, so the
-            # frontend can render the whole attended sequence and mute specials
-            # in TTS. Display order = sequence order = attention key order.
+            # Full-sequence token labels for the attention timescale
             if req.return_attention:
                 step_data["prompt_tokens"] = _prompt_tokens
                 step_data["prompt_specials"] = _prompt_specials
@@ -528,7 +521,7 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                 ]
             yield _sse("step", step_data)
 
-        # ── done or cancelled ──────────────────────────────────────────────
+        # done or cancelled
         if _cancel.is_set():
             yield _sse("cancelled", {"message": "Generation stopped by user"})
             return
