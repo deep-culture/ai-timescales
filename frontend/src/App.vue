@@ -323,8 +323,8 @@ const lastStepJson = computed(() => lastStep.value ? JSON.stringify(lastStep.val
 
 // params
 const genLength = ref(64)
-const steps = ref(8)
-const temperature = ref(0)
+const steps = ref(32)
+const temperature = ref(0.2)
 const blockLength = ref(64)
 const ttsEnabled = ref(true)
 const ttsVolume = ref(1)
@@ -1468,8 +1468,15 @@ function renderDiffusion(ev: StepEvent) {
   tokens.length = 0
   pushPromptTokens(ev)   // attention timescale only (no-op otherwise)
   for (let i = 0; i < ev.decoded_tokens.length; i++) {
-    //if (maskSet.has(i)) tokens.push({ text: '▒', cls: 'tok-mask' })
-    tokens.push({ text: ev.decoded_tokens[i] || '\u00a0', cls: responseClass(ev, i, revSet.has(i)) })
+    // Still-masked positions keep their literal <|mdm_mask|> text and get the
+    // grainy mask laid over it. The class comes from mask_positions rather than
+    // from the token string: the literal is "<|mdm_mask|>", pipes included, so
+    // a text comparison is easy to get wrong and then silently styles nothing.
+    const cls = responseClass(ev, i, revSet.has(i))
+    tokens.push({
+      text: ev.decoded_tokens[i] || '\u00a0',
+      cls: maskSet.has(i) ? `${cls} noise-token` : cls,
+    })
   }
 }
 
@@ -1739,7 +1746,6 @@ button:not(:disabled):hover {
   cursor: pointer;
 }
 
-
 #output-box {
   margin-top: 1rem;
 }
@@ -1757,6 +1763,20 @@ button:not(:disabled):hover {
   padding: .3rem;
   transition: filter 0.35s ease;
   display: inline-block;
+}
+
+.output span.noise-token {
+  --lines: .003px;
+  mask: repeating-radial-gradient(
+    circle at center,
+    #000,
+    var(--lines),
+    #000,
+    0, /* transition hints make code easier to manage */
+    #0000,
+    calc(var(--lines) * 2),
+    #0000 0 /* trailing 0 is part of the hard stop logic */
+  );
 }
 
 input::-webkit-outer-spin-button,
@@ -1924,16 +1944,14 @@ input[type=number] {
   outline-offset: -1px;
 }
 
-/* Attention timescale: prompt context tokens — present and attended-to, but
-   muted relative to the response so the generated text still reads clearly. */
+/* Prompt context tokens, and the special / chat-template markers that share
+   their styling: <|endoftext|>, <|eot_id|>, <|start_header_id|>, <|mdm_mask|>
+   and friends. All are present and attended over, but muted relative to the
+   response so the generated text still reads clearly. Specials keep their own
+   class so they can be targeted separately — they just inherit this look. */
 .tok-prompt, .tok-special {
   background-color: var(--color-secondary);
   cursor: auto;
-}
-
-/* Special / chat-template tokens (e.g. <|start_header_id|>) — shown because the
-   model attends over them, but rendered small + dimmed as clear artefacts. */
-.tok-special {
 }
 
 /* login overlay */

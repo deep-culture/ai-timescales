@@ -346,6 +346,14 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
     # all_special_ids, so include it explicitly — otherwise it renders as a plain
     # prompt token and gets sonified ("MDMask") instead of being muted.
     _special_ids = set(getattr(gen.tokenizer, "all_special_ids", []) or []) | {MASK_ID}
+
+    # add some more special tokens
+    for _tid, _tok in (getattr(gen.tokenizer, "added_tokens_decoder", {}) or {}).items():
+        if getattr(_tok, "special", False):
+            try:
+                _special_ids.add(int(_tid))
+            except (TypeError, ValueError):
+                pass
     _prompt_id_list = prompt[0].tolist() if req.return_attention else []
     _prompt_tokens = [gen.decode_ids([t]) for t in _prompt_id_list]
     _prompt_specials = [bool(t in _special_ids) for t in _prompt_id_list]
@@ -512,13 +520,16 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
                     layers_obj["dla"] = item.attention_dla.tolist()
                 step_data["layers"] = layers_obj
 
-            # Full-sequence token labels for the attention timescale
+            # Per-token "is special" flag for the generated tokens
+            step_data["decoded_specials"] = [
+                bool(t in _special_ids) for t in item.token_ids
+            ]
+            # Full-sequence prompt labels: attention timescale only — decoding
+            # the prompt token-by-token is the costly part and nothing else
+            # renders it.
             if req.return_attention:
                 step_data["prompt_tokens"] = _prompt_tokens
                 step_data["prompt_specials"] = _prompt_specials
-                step_data["decoded_specials"] = [
-                    bool(t in _special_ids) for t in item.token_ids
-                ]
             yield _sse("step", step_data)
 
         # done or cancelled
