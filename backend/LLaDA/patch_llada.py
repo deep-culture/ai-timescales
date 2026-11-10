@@ -114,7 +114,11 @@ def _record_attn_eigenzeit(module, _args):
         return
     ev = getattr(module, "_attn_start_event", None)
     if ev is not None:
-        ev.record()
+        # Record using this device (GPU). With no
+        # argument, Event.record() uses the current stream of the *current*
+        # device, which stays cuda:0 even when the model was placed on cuda:1.
+        dev = getattr(module, "_attn_event_device", None)
+        ev.record(torch.cuda.current_stream(dev))
     module._attn_time_ns = time.perf_counter_ns()
 
 
@@ -132,6 +136,29 @@ def patch_model(model):
     """
     use_events = torch.cuda.is_available()
     blocks = model.model.transformer.blocks
+
+    # Which device the timing events belong on (see _record_attn_eigenzeit).
+    blk_devices = []
+    for blk in blocks:
+        try:
+            blk_devices.append(next(blk.parameters()).device)
+        except StopIteration:
+            blk_devices.append(None)
+    one_device = (
+        blk_devices[0]
+        if blk_devices and all(d == blk_devices[0] for d in blk_devices)
+        else None
+    )
+    if use_events and (one_device is None or one_device.type != "cuda"):
+        print(
+            "[patch_llada] blocks are not all on one CUDA device "
+            f"({sorted({str(d) for d in blk_devices})}) — per-layer timings will "
+            "use the CPU clock (launch offsets, not GPU execution times)."
+        )
+        use_events = False
+    # Read back by collect_layer_attention when it resolves the events.
+    model._attn_event_device = one_device if use_events else None
+
     for blk in blocks:
         # Preserve the original SDPA so the non-capture path stays fast/faithful.
         blk._orig_sdpa = blk._scaled_dot_product_attention
@@ -143,6 +170,7 @@ def patch_model(model):
         blk._attn_output = None
         blk._attn_time_ns = 0
         # GPU timing marker (reused/re-recorded each step). None on CPU/MPS.
+        blk._attn_event_device = one_device if use_events else None
         blk._attn_start_event = (
             torch.cuda.Event(enable_timing=True) if use_events else None
         )
@@ -208,7 +236,9 @@ def collect_layer_attention(
         events.append(getattr(blk, "_attn_start_event", None))
         fallback_ns.append(int(getattr(blk, "_attn_time_ns", 0)))
         blk._attn_weights = None  # free the GPU copy now that it's been read
-    timings = gpu_event_offsets_ns(events, fallback_ns)
+    timings = gpu_event_offsets_ns(
+        events, fallback_ns, getattr(model, "_attn_event_device", None)
+    )
     return torch.stack(weights, dim=0), timings  # (n_layers, T, T)
 
 
