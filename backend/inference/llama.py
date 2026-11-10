@@ -42,6 +42,7 @@ class LlamaGenerator(BaseGenerator):
         self._prompt_len: int = 0
         self._layer_entry_ns: dict[int, int] = {}  # per-layer CPU-fallback Eigenzeit
         self._layer_events: list = []  # per-layer CUDA timing events (GPU Eigenzeit)
+        self._layer_device = None  # the one device the layers share, else None
 
     def load(self) -> None:
         n_gpus = torch.cuda.device_count()
@@ -107,10 +108,40 @@ class LlamaGenerator(BaseGenerator):
         handles = []
         # One reusable CUDA timing event per layer, recorded into the stream the
         # instant the GPU reaches that layer's attention (async — no CPU stall).
-        n_layers = len(self.model.model.layers)
+        #
+        # The events have to be recorded on the stream of the device the layers
+        # actually live on. Event.record() with no stream uses the *current*
+        # device, which stays cuda:0 even when this model was placed on cuda:1,
+        # so the events would land on an idle stream and time nothing.
+        # A model sharded by device_map="auto" across several GPUs has no common
+        # clock, so there we keep the CUDA path off entirely and let gpu_event_offsets_ns
+        # report the fallback.
+        layers = self.model.model.layers
+        n_layers = len(layers)
+        devs = []
+        for layer in layers:
+            try:
+                devs.append(next(layer.parameters()).device)
+            except StopIteration:
+                devs.append(None)
+        self._layer_device = (
+            devs[0] if devs and all(d == devs[0] for d in devs) else None
+        )
+        use_events = (
+            torch.cuda.is_available()
+            and self._layer_device is not None
+            and self._layer_device.type == "cuda"
+        )
+        if torch.cuda.is_available() and not use_events:
+            print(
+                "[Llama] layers do not share one CUDA device "
+                f"({sorted({str(d) for d in devs})}) — per-layer timings will "
+                "use the CPU clock (launch offsets, not GPU execution times).",
+                flush=True,
+            )
         self._layer_events = (
             [torch.cuda.Event(enable_timing=True) for _ in range(n_layers)]
-            if torch.cuda.is_available()
+            if use_events
             else [None] * n_layers
         )
         for idx, layer in enumerate(self.model.model.layers):
@@ -118,7 +149,8 @@ class LlamaGenerator(BaseGenerator):
                 def _hook(_module, _inp):
                     ev = self._layer_events[i]
                     if ev is not None:
-                        ev.record()
+                        # Explicit stream → the layers' own device, not cuda:0.
+                        ev.record(torch.cuda.current_stream(self._layer_device))
                     self._layer_entry_ns[i] = time.perf_counter_ns()  # CPU fallback
                 return _hook
             def _make_output(i: int):
@@ -199,6 +231,7 @@ class LlamaGenerator(BaseGenerator):
                         layer_timings = gpu_event_offsets_ns(
                             self._layer_events[:n_layers],
                             [self._layer_entry_ns.get(i, 0) for i in range(n_layers)],
+                            self._layer_device,
                         )
                         # ── direct logit attribution for the generated token ──
                         if (self._final_resid is not None
