@@ -1837,13 +1837,13 @@ button:not(:disabled):hover {
   min-height: 5em;
   margin-top: 2rem;
   margin-bottom: 1rem;
-  font-size: 2rem;
+  font-size: 1.5rem;
   line-height: 2rem;
 }
 
 .output span {
   margin: .2rem;
-  padding: .3rem;
+  padding: .1rem;
   transition: filter 0.35s ease, opacity 0.35s ease;
   display: inline-block;
 }
