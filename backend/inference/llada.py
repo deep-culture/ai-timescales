@@ -226,11 +226,18 @@ class LLaDAGenerator(BaseGenerator):
         logits_noisy = _add_gumbel_noise(logits, temperature)
         x0 = torch.argmax(logits_noisy, dim=-1)
 
+        # The model's probability for its own argmax at every position. Computed
+        # here, before the two things that would corrupt it as a display value:
+        # the block mask below writes -inf past blk_end, and the "random"
+        # remasking strategy replaces x0_p with noise. This is the honest
+        # per-position confidence, independent of the sampling strategy.
+        p = F.softmax(logits, dim=-1)
+        conf_all = torch.squeeze(
+            torch.gather(p, dim=-1, index=x0.unsqueeze(-1)), -1
+        )
+
         if remasking == "low_confidence":
-            p = F.softmax(logits, dim=-1)
-            x0_p = torch.squeeze(
-                torch.gather(p, dim=-1, index=x0.unsqueeze(-1)), -1
-            )
+            x0_p = conf_all.clone()
         elif remasking == "random":
             x0_p = torch.rand(x0.shape, device=x0.device)
         else:
@@ -264,6 +271,7 @@ class LLaDAGenerator(BaseGenerator):
             step_index=global_step,
             token_ids=gen_ids,
             decoded_tokens=decoded,
+            confidences=conf_all[0, prompt_len:].float().cpu().tolist(),
             attention=attn,
             mask_positions=masks,
             newly_revealed=revealed,

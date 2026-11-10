@@ -110,6 +110,10 @@ class StepResult:
     newly_revealed: List[int] = field(default_factory=list)  # indices revealed this step
     elapsed_s: float = 0.0                  # seconds since generation start (set by backend)
 
+    # Per-generated-position confidence: the model's softmax probability for its
+    # own argmax at that position
+    confidences: List[float] = field(default_factory=list)
+
     # ── second timescale: per-layer attention "echoes" ──────────────────────
     # Populated only on the *final* step of a sequence (the layer playback runs
     # once generation is done). ``attention_layers`` stacks every transformer

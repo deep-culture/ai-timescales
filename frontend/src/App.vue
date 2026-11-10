@@ -172,6 +172,7 @@
           @click="onTokenClick(i)"
           :style="{
             cursor: (timescale === 'attention' && isDiffAttnMode) ? 'pointer' : 'default',
+            opacity: tokenOpacity[i] ?? 1,
             filter: (timescale === 'attention' && tokenBlurs[i] !== undefined)
               ? `blur(${tokenBlurs[i].toFixed(2)}px)` : 'none',
           }"
@@ -194,6 +195,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import HeartbeatGraph from './components/HeartbeatGraph.vue'
+import whitenoiseUrl from './assets/whitenoise.ogg'
 
 // types
 // Per-layer "attention echoes"
@@ -217,6 +219,7 @@ interface StepEvent {
   mask_positions: number[]
   newly_revealed: number[]
   diffusion?: boolean             // model type, from the backend (never inferred)
+  confidences?: number[]          // per generated position: p(argmax) this step
   attention?: number[] | number[][]          // mean: 1D (AR) or 2D (diffusion)
   attention_heads?: number[][] | number[][][] // per-head: (n_heads,T) or (n_heads,gen,T)
   n_heads?: number
@@ -339,6 +342,16 @@ const selectedHeads = reactive(new Set<number>())
 const nHeads = ref(32)
 const availableVoices = ref<string[]>(['af_heart'])
 const tokenBlurs = reactive<number[]>([])
+// Per displayed token: 0.2-1, driven by the model's confidence at that position
+// this step. Prompt tokens are 1.
+const tokenOpacity = reactive<number[]>([])
+
+const OPACITY_FLOOR = 0.2
+function confidenceOpacity(c: number | undefined): number {
+  if (c === undefined || Number.isNaN(c)) return 1
+  const v = Math.max(0, Math.min(1, c))
+  return OPACITY_FLOOR + (1 - OPACITY_FLOOR) * v
+}
 
 // layer "echo" playback
 // Layer data from the final step of the last sequence (carries every layer's
@@ -780,6 +793,20 @@ function getTtsBuffer(text: string, voice: string, speed = 1.2): Promise<AudioBu
   return p
 }
 
+// The mask sound, white noise
+let _noiseBufferProm: Promise<AudioBuffer | null> | null = null
+function getNoiseBuffer(): Promise<AudioBuffer | null> {
+  if (_noiseBufferProm) return _noiseBufferProm
+  _noiseBufferProm = (async () => {
+    try {
+      const res = await fetch(whitenoiseUrl)
+      if (!res.ok) return null
+      return await getAudioCtx().decodeAudioData(await res.arrayBuffer())
+    } catch { return null }
+  })()
+  return _noiseBufferProm
+}
+
 // Fetch TTS for a list of token texts; returns decoded AudioBuffers with their pan positions
 async function fetchTtsBuffers(tokenTexts: string[], pans: number[], voice = 'af_heart'): Promise<{ buffer: AudioBuffer; pan: number }[]> {
   const results = await Promise.all(tokenTexts.map(async (text, i) => {
@@ -811,10 +838,12 @@ function playAudioBuffers(items: { buffer: AudioBuffer; pan: number }[], startOf
 }
 
 // Display queue — audioProm is started lazily (1-step lookahead only)
+type AudioItem = { buffer: AudioBuffer; pan: number; volume: number }
+
 interface QueuedStep {
   ev: StepEvent
   renderFn: (ev: StepEvent) => void
-  audioProm?: Promise<{ buffer: AudioBuffer; pan: number }[]>
+  audioProm?: Promise<AudioItem[]>
 }
 
 let _displayQueue: QueuedStep[] = []
@@ -825,15 +854,41 @@ function resetDisplayQueue(): void {
   _draining = false
 }
 
-function _buildAudioProm(ev: StepEvent): Promise<{ buffer: AudioBuffer; pan: number }[]> {
+function _buildAudioProm(ev: StepEvent): Promise<AudioItem[]> {
   if (!ttsEnabled.value) return Promise.resolve([])
+  return ev.diffusion ? _buildDiffusionBed(ev) : _buildARStepAudio(ev)
+}
+
+// AR for inference: one token at a time
+async function _buildARStepAudio(ev: StepEvent): Promise<AudioItem[]> {
   const totalLen = genLength.value
-  const tokenTexts = ev.newly_revealed.map(i => ev.decoded_tokens[i])
-  const pans = ev.newly_revealed.map(i => {
-    const t = totalLen > 1 ? i / (totalLen - 1) : 0.5
-    return (t * 2) - 1
-  })
-  return fetchTtsBuffers(tokenTexts, pans)
+  const items = await Promise.all(ev.newly_revealed.map(async i => {
+    const text = ev.decoded_tokens[i]
+    if (!text || !text.trim()) return null
+    const buffer = await getTtsBuffer(text, 'af_heart')
+    return buffer ? { buffer, pan: panForIndex(i, totalLen), volume: 1 } : null
+  }))
+  return items.filter((x): x is AudioItem => x !== null)
+}
+
+// DLM at inference: all tokens are always sonified, with mask token as white noise.
+async function _buildDiffusionBed(ev: StepEvent): Promise<AudioItem[]> {
+  const totalLen = genLength.value
+  const maskSet = new Set(ev.mask_positions)
+  const items = await Promise.all(ev.decoded_tokens.map(async (text, i) => {
+    const volume = Math.max(0, Math.min(1, ev.confidences?.[i] ?? 0))
+    const pan = panForIndex(i, totalLen)
+
+    if (maskSet.has(i)) {
+      const buffer = await getNoiseBuffer()
+      return buffer ? { buffer, pan, volume } : null
+    }
+    if (ev.decoded_specials?.[i]) return null
+    if (!text || !text.trim()) return null
+    const buffer = await getTtsBuffer(text, tokenVoice(i))
+    return buffer ? { buffer, pan, volume } : null
+  }))
+  return items.filter((x): x is AudioItem => x !== null)
 }
 
 // Serial drain: 1-step TTS lookahead.
@@ -857,7 +912,7 @@ async function drainDisplayQueue(): Promise<void> {
     pushHeartbeat(item.ev)
     item.renderFn(item.ev)
     scrollOutput()
-    playAudioBuffers(items)
+    playAudioBuffersWithVolumes(items)
     await nextTick()
     await new Promise(r => setTimeout(r, 0))
   }
@@ -1456,6 +1511,9 @@ function onTokenClick(i: number) {
 function renderAR(ev: StepEvent) {
   const revSet = new Set(ev.newly_revealed)
   tokens.length = 0
+  // An AR step predicts one position, not all of them, so there is no
+  // per-token confidence to show.
+  tokenOpacity.length = 0
   pushPromptTokens(ev)   // attention timescale only (no-op otherwise)
   for (let i = 0; i < ev.decoded_tokens.length; i++) {
     tokens.push({ text: ev.decoded_tokens[i] || '\u00a0', cls: responseClass(ev, i, revSet.has(i)) })
@@ -1466,13 +1524,18 @@ function renderDiffusion(ev: StepEvent) {
   const maskSet = new Set(ev.mask_positions)
   const revSet = new Set(ev.newly_revealed)
   tokens.length = 0
+  tokenOpacity.length = 0
   pushPromptTokens(ev)   // attention timescale only (no-op otherwise)
+  // Prompt tokens are given context, not predictions — always fully opaque.
+  for (let i = 0; i < (ev.prompt_tokens?.length ?? 0); i++) tokenOpacity.push(1)
   for (let i = 0; i < ev.decoded_tokens.length; i++) {
     // Still-masked positions keep their literal <|mdm_mask|> text and get the
     // grainy mask laid over it. The class comes from mask_positions rather than
     // from the token string: the literal is "<|mdm_mask|>", pipes included, so
     // a text comparison is easy to get wrong and then silently styles nothing.
     const cls = responseClass(ev, i, revSet.has(i))
+    // Pushed in lockstep with tokens, so display index == opacity index.
+    tokenOpacity.push(confidenceOpacity(ev.confidences?.[i]))
     tokens.push({
       text: ev.decoded_tokens[i] || '\u00a0',
       cls: maskSet.has(i) ? `${cls} noise-token` : cls,
@@ -1761,7 +1824,7 @@ button:not(:disabled):hover {
 .output span {
   margin: .2rem;
   padding: .3rem;
-  transition: filter 0.35s ease;
+  transition: filter 0.35s ease, opacity 0.35s ease;
   display: inline-block;
 }
 

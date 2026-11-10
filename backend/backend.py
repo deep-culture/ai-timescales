@@ -524,6 +524,11 @@ async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> Str
             step_data["decoded_specials"] = [
                 bool(t in _special_ids) for t in item.token_ids
             ]
+            # Per-position argmax confidence (diffusion only)
+            if item.confidences:
+                step_data["confidences"] = [
+                    round(float(c), 5) for c in item.confidences
+                ]
             # Full-sequence prompt labels: attention timescale only — decoding
             # the prompt token-by-token is the costly part and nothing else
             # renders it.
