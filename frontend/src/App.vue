@@ -323,9 +323,9 @@ const lastStepJson = computed(() => lastStep.value ? JSON.stringify(lastStep.val
 
 // params
 const genLength = ref(64)
-const steps = ref(64)
+const steps = ref(8)
 const temperature = ref(0)
-const blockLength = ref(32)
+const blockLength = ref(64)
 const ttsEnabled = ref(true)
 const ttsVolume = ref(1)
 
