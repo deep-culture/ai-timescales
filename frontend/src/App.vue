@@ -188,9 +188,7 @@
       <pre class="raw-step" v-if="lastStep">{{ lastStepJson }}</pre>
     </div>
     <footer>
-      <a href="https://deep-culture.org">
-        <img src="./assets/deep-culture.png" alt="Deep Culture"/>
-      </a>
+
     </footer>
   </main>
   </template>

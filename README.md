@@ -2,12 +2,11 @@
 
 AI Timescales lets you listen to the timescales of inference and attention of two model architectures: autoregressive and diffusion language models.
 
-<em>Click for audio</em>
-<a href="https://deep-culture.org/ai-timescales/ar-lm-inference.mp4" target="_blank"><img width="1274" height="880" alt="ar-lm-generation" src="https://github.com/user-attachments/assets/89fa4f29-3aa6-460f-89d8-7744b6775be5" /></a>
-
-<em>Click for audio</em>
-<a href="https://deep-culture.org/ai-timescales/dlm-inference.mp4" target="_blank"><img width="1282" height="882" alt="dlm-generation" src="https://github.com/user-attachments/assets/80e00290-9ff9-4678-b069-6d9679b702c4" /></a>
-
+<p align="center">
+  <img src="frontend/src/assets/ar-lm-inference.gif" width=100%" alt="AR-LM inference">
+  <img src="frontend/src/assets/dlm-inference.gif" width="100%" alt="DLM inference">
+  <img src="frontend/src/assets/dlm-attention.gif" width="100%" alt="DLM attention">
+</p>
 
 ## Requirements
 
