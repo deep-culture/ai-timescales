@@ -177,7 +177,7 @@
           @click="onTokenClick(i)"
           :style="{
             cursor: (timescale === 'attention' && isDiffAttnMode) ? 'pointer' : 'default',
-            opacity: tokenOpacity[i] ?? 1,
+            opacity: timescale === 'inference' ? (tokenOpacity[i] ?? 1) : 1,
             filter: (timescale === 'attention' && tokenBlurs[i] !== undefined)
               ? `blur(${tokenBlurs[i].toFixed(2)}px)` : 'none',
           }"
@@ -350,6 +350,16 @@ const tokenBlurs = reactive<number[]>([])
 // Per displayed token: 0.2-1, driven by the model's confidence at that position
 // this step. Prompt tokens are 1.
 const tokenOpacity = reactive<number[]>([])
+
+// Both arrays are indexed by display position, so they only mean anything for
+// the render that filled them. Every path that rebuilds `tokens` clears them
+// first and refills what it needs in the same tick - otherwise switching
+// timescale, or switching between the AR-LM and the DLM, repaints the new
+// sequence with the previous one's blurs and opacities.
+function resetTokenStyles(): void {
+  tokenBlurs.length = 0
+  tokenOpacity.length = 0
+}
 
 const OPACITY_FLOOR = 0.2
 function confidenceOpacity(c: number | undefined): number {
@@ -955,8 +965,7 @@ function switchTimescale(mode: 'inference' | 'attention') {
   diffRunPrompt = ''
   diffCurrentAttn.value = null
   selectedTokenIdx.value = 0
-  tokenBlurs.length = 0
-  tokenOpacity.length = 0
+  resetTokenStyles()
   headAvg.value = true
   selectedHeads.clear()
   echoStep.value = null
@@ -1337,6 +1346,7 @@ async function nextARStep() {
   // accumulated response (last token = query, always sharp).
   const PL = promptLen(ev)
   tokens.length = 0
+  resetTokenStyles()
   pushPromptTokens(ev)
   for (let i = 0; i < arAttnTokens.length; i++) {
     tokens.push({
@@ -1517,7 +1527,7 @@ function onTokenClick(i: number) {
 function renderAR(ev: StepEvent) {
   const revSet = new Set(ev.newly_revealed)
   tokens.length = 0
-  tokenOpacity.length = 0
+  resetTokenStyles()
   pushPromptTokens(ev)   // attention timescale only (no-op otherwise)
   // Prompt tokens are given context, not predictions - always fully opaque.
   for (let i = 0; i < (ev.prompt_tokens?.length ?? 0); i++) tokenOpacity.push(1)
@@ -1531,7 +1541,7 @@ function renderDiffusion(ev: StepEvent) {
   const maskSet = new Set(ev.mask_positions)
   const revSet = new Set(ev.newly_revealed)
   tokens.length = 0
-  tokenOpacity.length = 0
+  resetTokenStyles()
   pushPromptTokens(ev)   // attention timescale only (no-op otherwise)
   // Prompt tokens are given context, not predictions — always fully opaque.
   for (let i = 0; i < (ev.prompt_tokens?.length ?? 0); i++) tokenOpacity.push(1)
