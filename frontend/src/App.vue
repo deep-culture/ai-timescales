@@ -855,6 +855,44 @@ function playAudioBuffers(items: { buffer: AudioBuffer; pan: number }[], startOf
 // Display queue — audioProm is started lazily (1-step lookahead only)
 type AudioItem = { buffer: AudioBuffer; pan: number; volume: number }
 
+// Sound position on the attention timescale containing index plus and how it
+// should be played (no special tokens but play mask tokesn as white noise)
+type SoundSpec = { idx: number; pan: number; volume: number; masked: boolean }
+
+// The text at a display index: prompt/template tokens first, then the response.
+function textAt(ev: StepEvent, d: number, PL: number, respTexts: string[]): string {
+  return d < PL ? (ev.prompt_tokens?.[d] ?? '') : (respTexts[d - PL] ?? '')
+}
+
+// Does this position make a sound at all?
+function soundsAt(
+  ev: StepEvent, d: number, PL: number, respTexts: string[], masked: boolean,
+): boolean {
+  if (masked) return true
+  if (isSpecialAt(ev, d)) return false
+  return !!textAt(ev, d, PL, respTexts).trim()
+}
+
+async function bufferForDisplayIndex(
+  ev: StepEvent, d: number, PL: number, respTexts: string[], masked: boolean,
+): Promise<AudioBuffer | null> {
+  if (!soundsAt(ev, d, PL, respTexts, masked)) return null
+  if (masked) return getNoiseBuffer()
+  return getTtsBuffer(textAt(ev, d, PL, respTexts), tokenVoice(d))
+}
+
+// Resolve a schedule to decoded buffers, dropping positions with no audio.
+async function fetchSpecBuffers(
+  ev: StepEvent, specs: SoundSpec[], respTexts: string[],
+): Promise<AudioItem[]> {
+  const PL = promptLen(ev)
+  const items = await Promise.all(specs.map(async s => {
+    const buffer = await bufferForDisplayIndex(ev, s.idx, PL, respTexts, s.masked)
+    return buffer ? { buffer, pan: s.pan, volume: s.volume } : null
+  }))
+  return items.filter((x): x is AudioItem => x !== null)
+}
+
 interface QueuedStep {
   ev: StepEvent
   renderFn: (ev: StepEvent) => void
@@ -1086,12 +1124,12 @@ function getLayerRow(layers: LayerData, l: number, rowIdx?: number): number[] {
     rows.reduce((s, r) => s + (r[i] ?? 0), 0) / rows.length)
 }
 
-// Build one layer's playback: attention-weighted TTS tokens.
+// Build one layer's playback: attention-weighted sounds.
 // Iterates the FULL sequence (prompt + response): prompt words are spoken at
-// their attention weight, special/template tokens are muted, and
-// each token's voice follows its sequence position.
-function buildLayerSchedule(ev: StepEvent, layers: LayerData, l: number):
-  { texts: string[]; pans: number[]; vols: number[]; voices: string[];} {
+// their attention weight, still-masked positions are heard as white noise at
+// theirs, special/template tokens are muted, and each token's voice follows
+// its sequence position.
+function buildLayerSchedule(ev: StepEvent, layers: LayerData, l: number): SoundSpec[] {
   const PL = promptLen(ev)
   const isDiff = layers.diffusion
   const respTexts = isDiff ? ev.decoded_tokens : (arAttnTokens as string[])
@@ -1099,19 +1137,23 @@ function buildLayerSchedule(ev: StepEvent, layers: LayerData, l: number):
   const q = isDiff ? selectedTokenIdx.value : T - 1   // query display index
   const row = getLayerRow(layers, l, isDiff ? q - PL : undefined)
   const maskSet = new Set(ev.mask_positions.map(m => PL + m))
-  const norm = Math.max(...row.slice(0, T).filter((_, d) => d !== q && !maskSet.has(d)), 1e-9)
 
-  const texts: string[] = [], pans: number[] = [], vols: number[] = [], voices: string[] = []
+  // Everything this layer sounds: prompt words, revealed tokens, and the
+  // still-masked positions as noise. Specials stay muted.
+  const idxs: number[] = []
   for (let d = 0; d < T; d++) {
     if (d === q) continue
-    const pan = panForIndex(d, T)
-    const v = (row[d] ?? 0) / norm
-    if (isSpecialAt(ev, d)) continue            // mute special/template tokens
-    const text = d < PL ? (ev.prompt_tokens?.[d] ?? '') : respTexts[d - PL]
-    if (!text || !text.trim()) continue
-    texts.push(text); pans.push(pan); vols.push(v); voices.push(tokenVoice(d))
+    if (soundsAt(ev, d, PL, respTexts, maskSet.has(d))) idxs.push(d)
   }
-  return { texts, pans, vols, voices }
+  // Masks share one scale with the words rather than being normalised apart,
+  // so the mix states plainly where the layer's attention actually went.
+  const norm = Math.max(...idxs.map(d => row[d] ?? 0), 1e-9)
+  return idxs.map(d => ({
+    idx: d,
+    pan: panForIndex(d, T),
+    volume: (row[d] ?? 0) / norm,
+    masked: maskSet.has(d),
+  }))
 }
 
 // Per-layer start offsets (seconds, relative to the first layer).
@@ -1218,9 +1260,10 @@ async function playLayerEchoes() {
   echoStatus.value = ['processing', `Playing ${L} attention layers (${playbackMode.value})…`]
   try {
     // Pre-fetch every layer's TTS buffers in parallel so scheduling is precise.
+    const respTexts = layers.diffusion ? ev.decoded_tokens : (arAttnTokens as string[])
     const scheds = Array.from({ length: L }, (_, l) => buildLayerSchedule(ev, layers, l))
-    const bufsPerLayer = await Promise.all(scheds.map(s =>
-      fetchTtsBuffersWithVolumes(s.texts, s.pans, s.vols, s.voices)))
+    const bufsPerLayer = await Promise.all(
+      scheds.map(sp => fetchSpecBuffers(ev, sp, respTexts)))
 
     const ctx = getAudioCtx()
     const offsets = computeLayerOffsets(layers)
@@ -1475,39 +1518,43 @@ async function playDiffusionAttentionTTS(ev: StepEvent) {
   const sel = selectedTokenIdx.value               // display index of the query
   const maskSet = new Set(ev.mask_positions.map(m => PL + m))
 
-  // Selected token: play at full volume in its own per-position voice (always sharp)
-  if (!maskSet.has(sel)) {
-    const selText = sel < PL ? (ev.prompt_tokens?.[sel] ?? '') : ev.decoded_tokens[sel - PL]
-    const selBufs = await fetchTtsBuffersWithVolumes(
-      [selText], [panForIndex(sel, T)], [1], [tokenVoice(sel)])
-    if (selBufs.length) {
-      const dur = playAudioBuffersWithVolumes(selBufs)
-      await new Promise(r => setTimeout(r, dur * 1000 + 80))
-    }
+  // Selected token: full volume, its own per-position voice (always sharp). A
+  // still-masked position is selectable too, so it sounds as noise rather than
+  // falling silent.
+  const selBuf = await bufferForDisplayIndex(
+    ev, sel, PL, ev.decoded_tokens, maskSet.has(sel))
+  if (selBuf) {
+    const dur = playAudioBuffersWithVolumes(
+      [{ buffer: selBuf, pan: panForIndex(sel, T), volume: 1 }])
+    await new Promise(r => setTimeout(r, dur * 1000 + 80))
   }
 
-  // Other tokens across the FULL sequence: prompt words + response tokens,
-  // muting special/template tokens.
-  const otherIdxs: number[] = [], otherTexts: string[] = [], otherPans: number[] = []
+  // The rest of the sequence: prompt words, revealed tokens, and every
+  // still-masked position as white noise - the inference timescale's bed, with
+  // the attention weight toward the query standing in for the confidence.
+  const specs: SoundSpec[] = []
   for (let d = 0; d < T; d++) {
-    if (d === sel || maskSet.has(d) || isSpecialAt(ev, d)) continue
-    const text = d < PL ? (ev.prompt_tokens?.[d] ?? '') : ev.decoded_tokens[d - PL]
-    if (!text || !text.trim()) continue
-    otherIdxs.push(d)
-    otherTexts.push(text)
-    otherPans.push(panForIndex(d, T))
+    if (d === sel) continue
+    if (!soundsAt(ev, d, PL, ev.decoded_tokens, maskSet.has(d))) continue
+    specs.push({
+      idx: d,
+      pan: panForIndex(d, T),
+      volume: 0,                 // filled from the attention row below
+      masked: maskSet.has(d),
+    })
   }
-  if (!otherTexts.length) return
+  if (!specs.length) return
 
-  // Each token keeps its own per-position voice; its volume is the attention
-  // weight toward the selected query (averaged over the active head selection).
-  const row = getEffectiveAttnRow(ev, sel - PL)   // row is gen-indexed → strip prompt
-  const voices = otherIdxs.map(d => tokenVoice(d))
-  const rawVols = otherIdxs.map(d => row[d] ?? 0)
-  const maxV = Math.max(...rawVols, 1e-9)
-  const normVols = rawVols.map(v => v / maxV)
-  const bufs = await fetchTtsBuffersWithVolumes(otherTexts, otherPans, normVols, voices)
-  playAudioBuffersWithVolumes(bufs)
+  // Each position keeps its own per-position voice (noise for a mask); its
+  // volume is the attention weight toward the selected query, averaged over the
+  // active head selection. Masks share one scale with the words rather than
+  // being normalised apart, so the mix states plainly where the attention went.
+  const row = getEffectiveAttnRow(ev, sel - PL)   // row is gen-indexed -> strip prompt
+  for (const sp of specs) sp.volume = row[sp.idx] ?? 0
+  const maxV = Math.max(...specs.map(sp => sp.volume), 1e-9)
+  for (const sp of specs) sp.volume /= maxV
+  playAudioBuffersWithVolumes(
+    await fetchSpecBuffers(ev, specs, ev.decoded_tokens))
 }
 
 // token click handler
